@@ -1,0 +1,29 @@
+name: dpkg
+version: 1.21.22
+release: 19
+source:
+- https://ftp.debian.org/debian/pool/main/d/dpkg/dpkg_1.21.22.tar.xz: 5a1d15481bba79d7a4899fd55b4b6b18a987ca8d56ee8c43e9cab63b8a0a3545
+homepage: https://wiki.debian.org/dpkg/
+license: GPL-2.0-or-later
+summary: DO NOT USE THIS.
+description: 'Debian Package Manager - for Cross Distro Purposes. Do NOT use to attempt installation of packages on Solus,
+  it''s not compatible!
+
+  '
+component: programming.devel
+category: other
+builddeps:
+- pkgconfig(bzip2)
+- pkgconfig(liblzma)
+- pkgconfig(libmd)
+rundeps:
+- perl
+setup: "%configure \\\n    --disable-start-stop-daemon \\\n    --disable-install-info \\\n    --disable-static\n"
+build: '%make
+
+  '
+install: "%make_install\n%install_license COPYING\n\n# use standard names for man pages\nfor file in $installdir/usr/share/man/man3/*;\
+  \ do\n    newname=$(echo \"$file\" | sed -Ee 's/3perl/3/')\n    mv \"$file\" \"$newname\"\ndone\n\n# nuke docs\nrm -rf $installdir/usr/share/doc\n\
+  \n# why is this even here\nrm -f $installdir/etc/alternatives/README\n\n# delete empty dirs\nfind $installdir -type d -empty\
+  \ -delete\n\n# static bad\nrm $installdir/usr/lib64/libdpkg.a\n"
+patterns: []

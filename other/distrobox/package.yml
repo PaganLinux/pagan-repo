@@ -1,0 +1,25 @@
+name: distrobox
+version: 1.8.2.5
+release: 7
+source:
+- https://github.com/89luca89/distrobox/archive/refs/tags/1.8.2.5.tar.gz: 0c3bc4785ee3be3b89f93abb7cc0a9f60e56989e81319af140a4b60403b18f80
+homepage: https://distrobox.it/
+license: GPL-3.0-only
+summary: Use any Linux distribution inside your terminal
+description: 'Use any Linux distribution inside your terminal. Enable both backward and forward compatibility with software
+  and freedom to use whatever distribution you''re more comfortable with
+
+  '
+component: virt
+category: other
+builddeps: []
+rundeps:
+- podman
+setup: ''
+build: ''
+install: './install -P $installdir/usr
+
+  %install_license COPYING.md
+
+  '
+patterns: []

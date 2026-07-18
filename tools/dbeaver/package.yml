@@ -1,0 +1,63 @@
+name: dbeaver
+version: 25.3.2
+release: 66
+source:
+- https://github.com/dbeaver/dbeaver/archive/refs/tags/25.3.2.tar.gz#dbeaver.tar.gz: 2683033e4e2b993a3419df43f78df612db0dadf9576a7e843c9ca7ba43236bc5
+- https://github.com/dbeaver/dbeaver-common/archive/refs/tags/25.3.2.tar.gz#dbeaver-common.tar.gz: 26485ed11de9dea3e15308de24a40787f1812875ea731099b3bd5eb77894bc3c
+- https://github.com/dbeaver/dbeaver-jdbc-libsql/archive/refs/tags/25.3.2.tar.gz#dbeaver-jdbc-libsql.tar.gz: 677da58cf0b8a3cce76af9e25558731f5f06c7371b9a123d923de3e7eb089e10
+homepage: https://dbeaver.io/
+license: Apache-2.0
+summary: Free universal database manager and SQL client
+description: 'Free multi-platform database tool for developers, SQL programmers, database administrators and analysts.
+
+  '
+component: database
+category: tools
+builddeps:
+- apache-maven
+- openjdk-25
+rundeps:
+- openjdk-25
+setup: 'mkdir dbeaver dbeaver-common dbeaver-jdbc-libsql
+
+  tar --strip-components=1 -xf $sources/dbeaver.tar.gz -C dbeaver
+
+  tar --strip-components=1 -xf $sources/dbeaver-common.tar.gz -C dbeaver-common
+
+  tar --strip-components=1 -xf $sources/dbeaver-jdbc-libsql.tar.gz -C dbeaver-jdbc-libsql
+
+
+  cd dbeaver
+
+  %patch -Np1 -i $pkgfiles/0001-Disable-auto-update-check-by-default.patch
+
+  %patch -p1 -i $pkgfiles/0001-Change-default-theme-to-dark.patch
+
+
+  export MAVEN_OPTS="-Xmx2048m"
+
+  mvn --batch-mode -T 1C validate
+
+  '
+build: 'cd product/aggregate
+
+  export MAVEN_OPTS="-Xmx2048m"
+
+  mvn --batch-mode -Pall-platforms -Djdk.xml.maxGeneralEntitySizeLimit=0 -Djdk.xml.totalEntitySizeLimit=0 -T 1C package
+
+  '
+install: "%install_license LICENSE.md\nln -s /usr/share/dbeaver/licenses ${installdir}/usr/share/licenses/${package}/licenses\n\
+  \nexport _target_dir=product/community/target/products/org.jkiss.dbeaver.core.product/linux/gtk/x86_64/dbeaver\n\n# Remove\
+  \ different architecture libraries\nfor _dir in aix-ppc aix-ppc64 darwin-aarch64 darwin-x86-64 \\\n    dragonflybsd-x86-64\
+  \ freebsd-aarch64 freebsd-x86 freebsd-x86-64 \\\n    linux-aarch64 linux-arm linux-armel linux-loongarch64 linux-mips64el\
+  \ \\\n    linux-ppc linux-ppc64le linux-riscv64 linux-s390x linux-x86 \\\n    openbsd-x86 openbsd-x86-64 \\\n    sunos-sparc\
+  \ sunos-sparcv9 sunos-x86 sunos-x86-64 \\\n    win32 win32-aarch64 win32-x86 win32-x86-64\ndo\n    rm -r \"${_target_dir}/plugins/com.sun.jna_5.18.1.v20251001-0800/com/sun/jna/${_dir}\"\
+  \ndone\n\ninstall -dm00755 $installdir/usr/{bin,share}/\ncp -a $_target_dir $installdir/usr/share\nln -s /usr/share/dbeaver/dbeaver\
+  \ $installdir/usr/bin/dbeaver\n\n# Install icons\nfor _size in 16 32 48 64 128 256 512\ndo\n  install -Dm00644 product/community/icons-sources/icon_${_size}x${_size}.png\
+  \ \\\n    $installdir/usr/share/icons/hicolor/${_size}x${_size}/apps/dbeaver.png\ndone\n\n# Make dbeaver compatible with\
+  \ icon themes\ninstall -dm00755 $installdir/usr/share/pixmaps/\nrm -vf $installdir/usr/share/dbeaver/icon.xpm\ninstall -Dm00644\
+  \ $_target_dir/dbeaver.png $installdir/usr/share/pixmaps/dbeaver.png\ninstall -Dm00644 $_target_dir/icon.xpm $installdir/usr/share/pixmaps/dbeaver.xpm\n\
+  \n# Desktop file and appstream metainfo\ninstall -Dm00644 $pkgfiles/DBeaver.desktop -t $installdir/usr/share/applications/\n\
+  install -Dm00644 $pkgfiles/io.dbeaver.DBeaverCommunity.appdata.xml $installdir/usr/share/metainfo/io.dbeaver.DBeaverCommunity.appdata.xml\n\
+  \n# Set the correct OpenJDK\nsed -i '/-vmargs/i -vm\\n/usr/lib64/openjdk-25/bin/java' $installdir/usr/share/dbeaver/dbeaver.ini\n"
+patterns: []

@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║              PAG-REPO-UPDATE – Server Repository Index Generator             ║
+║    Automatycznie generuje repo.json i podpisuje go kluczem GPG po uploadzie   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+KLUCZOWE CECHY:
+  - Skanuje katalog z paczkami .pkg.tar.xz
+  - Wyciąga metadata.json z każdej paczki (z filtrem bezpieczeństwa)
+  - Generuje zbiorczy plik repo.json
+  - Podpisuje indeks kluczem GPG
+  - Obsługuje wielokrotne repozytoria (stable, gaming, etc.)
+
+PRZYKŁADOWE UŻYCIE:
+  pag-repo-update /var/www/repo/stable
+  pag-repo-update /var/www/repo/gaming
+
+CRON JOB (co 5 minut):
+  */5 * * * * /usr/local/bin/pag-repo-update /var/www/repo/stable > /var/log/pag-repo-update.log 2>&1
+"""
+
+import os
+import json
+import tarfile
+import subprocess
+import tempfile
+from datetime import datetime
+from typing import List, Dict, Optional
+
+# Konfiguracja
+REPO_DIR = "/var/www/repo/stable"  # Domyślna ścieżka - można nadpisać argumentem
+GPG_KEY_ID = ""  # Klucz GPG do podpisywania - można ustawić przez zmienne środowiskowe
+
+
+def parse_args():
+    """Parsuje argumenty wiersza poleceń."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="PAG Repository Index Generator",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("repo_dir", nargs="?", default=REPO_DIR,
+                       help="Ścieżka do katalogu repozytorium")
+    parser.add_argument("--gpg-key", metavar="KEY_ID",
+                       help="ID klucza GPG do podpisywania")
+    parser.add_argument("--no-sign", action="store_true",
+                       help="Nie podpisuj indeksu (tylko dla testów)")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Więcej informacji diagnostycznych")
+    
+    args = parser.parse_args()
+    return args
+
+
+def log(message: str, verbose: bool = False):
+    """Wypisuje komunikat, jeśli tryb verbose jest włączony."""
+    if verbose:
+        print(f"  📝 {message}")
+    else:
+        print(f"  {message}")
+
+
+def extract_metadata(pkg_path: str, verbose: bool = False) -> Optional[dict]:
+    """
+    Bezpiecznie wyciąga metadata.json z paczki.
+    Używa filtra 'data' dla tarfile, aby zapobiec directory traversal.
+    """
+    try:
+        with tarfile.open(pkg_path, "r:xz") as tf:
+            # Wyciągamy tylko plik metadata.json z filtrem bezpieczeństwa
+            try:
+                meta_member = tf.getmember("metadata.json")
+            except KeyError:
+                log(f"Plik {os.path.basename(pkg_path)} nie zawiera metadata.json", verbose)
+                return None
+            
+            # Wyciągamy zawartość z filtrem bezpieczeństwa
+            f = tf.extractfile(meta_member)
+            if f:
+                meta_data = json.loads(f.read().decode("utf-8"))
+                # Wstrzykujemy nazwę pliku, żeby klient wiedział, co pobrać
+                meta_data["filename"] = os.path.basename(pkg_path)
+                return meta_data
+    except Exception as e:
+        log(f"Błąd przetwarzania {os.path.basename(pkg_path)}: {e}", verbose)
+        return None
+    
+    return None
+
+
+def scan_packages(repo_dir: str, verbose: bool = False) -> List[dict]:
+    """Skanuje katalog w poszukiwaniu paczek i wyciąga ich metadane."""
+    packages = []
+    
+    if not os.path.isdir(repo_dir):
+        log(f"Katalog {repo_dir} nie istnieje", verbose)
+        return packages
+    
+    log(f"Skanowanie katalogu: {repo_dir}", verbose)
+    
+    # Skanujemy wszystkie pliki .pkg.tar.xz
+    for fname in sorted(os.listdir(repo_dir)):
+        if not fname.endswith(".pkg.tar.xz"):
+            continue
+            
+        pkg_path = os.path.join(repo_dir, fname)
+        log(f"Przetwarzanie: {fname}...", verbose)
+        
+        meta_data = extract_metadata(pkg_path, verbose)
+        if meta_data:
+            packages.append(meta_data)
+        else:
+            log(f"❌ Pominięto {fname} (brak ważnych metadanych)", verbose)
+    
+    log(f"✅ Znaleziono {len(packages)} ważnych paczek", verbose)
+    return packages
+
+
+def generate_repo_index(repo_dir: str, packages: List[dict]) -> str:
+    """Generuje plik repo.json z listą paczek."""
+    repo_index = {
+        "packages": packages,
+        "updated_at": datetime.now().isoformat(),
+        "generator": "pag-repo-update v1.0"
+    }
+    
+    repo_json_path = os.path.join(repo_dir, "repo.json")
+    
+    # Zapisujemy z wcięciami dla czytelności
+    with open(repo_json_path, "w") as f:
+        json.dump(repo_index, f, indent=2)
+    
+    return repo_json_path
+
+
+def sign_repo_index(repo_json_path: str, gpg_key_id: str, verbose: bool = False) -> bool:
+    """Podpisuje plik repo.json kluczem GPG."""
+    if not gpg_key_id:
+        log("⚠ Pominięto podpisywanie - brak klucza GPG", verbose)
+        return False
+    
+    sig_path = repo_json_path + ".sig"
+    
+    # Usuwamy stary podpis jeśli istnieje
+    if os.path.exists(sig_path):
+        os.remove(sig_path)
+    
+    log("Podpisywanie indeksu kluczem GPG...", verbose)
+    
+    try:
+        result = subprocess.run([
+            "gpg", "--detach-sign", "--armor",
+            "--local-user", gpg_key_id,
+            "--output", sig_path, repo_json_path
+        ], capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0:
+            log("✅ Indeks pomyślnie podpisany", verbose)
+            return True
+        else:
+            log(f"❌ Błąd GPG: {result.stderr.strip()}", verbose)
+            return False
+    except Exception as e:
+        log(f"❌ Wyjątek podczas podpisywania: {e}", verbose)
+        return False
+
+
+def main():
+    """Główna funkcja skryptu."""
+    args = parse_args()
+    
+    # Ustalamy klucz GPG: argument > env var > domyślny
+    gpg_key = args.gpg_key or os.environ.get("PAG_REPO_GPG_KEY") or GPG_KEY_ID
+    
+    print(f"🔄 Aktualizacja indeksu repozytorium: {args.repo_dir}")
+    
+    # 1. Skanujemy paczki
+    packages = scan_packages(args.repo_dir, args.verbose)
+    
+    if not packages:
+        print("❌ Brak ważnych paczek w repozytorium")
+        return 1
+    
+    # 2. Generujemy repo.json
+    repo_json_path = generate_repo_index(args.repo_dir, packages)
+    print(f"  ✅ Wygenerowano {repo_json_path}")
+    
+    # 3. Podpisujemy (jeśli nie --no-sign)
+    if not args.no_sign and gpg_key:
+        if sign_repo_index(repo_json_path, gpg_key, args.verbose):
+            print(f"  🔐 Utworzono podpis: {repo_json_path}.sig")
+        else:
+            print("  ⚠ Repozytorium wygenerowane, ale bez podpisu")
+    elif args.no_sign:
+        print("  ℹ️  Pominięto podpisywanie (--no-sign)")
+    else:
+        print("  ⚠ Pominięto podpisywanie (brak klucza GPG)")
+    
+    print(f"✅ Repozytorium gotowe: {len(packages)} paczek")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n❌ Przerwano przez użytkownika")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Krytyczny błąd: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

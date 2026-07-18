@@ -1,0 +1,34 @@
+name: dankmaterialshell
+version: 1.5.0
+release: 3
+source:
+- https://github.com/AvengeMedia/DankMaterialShell/archive/refs/tags/v1.5.0.tar.gz: 14f2678d6a15223ba069d1b8c8a21a5564b735d190c231f62ed44fd8bf48677c
+homepage: https://danklinux.com/
+license: MIT
+summary: Desktop shell for Wayland compositors built with Quickshell and Go
+description: 'DankMaterialShell is a complete desktop shell for niri, Hyprland, MangoWC, Sway, labwc, Scroll, Miracle WM,
+  and other Wayland compositors. It replaces waybar, swaylock, swayidle, mako, fuzzel, polkit, and everything else you''d
+  normally stitch together to make a desktop.
+
+  '
+component: desktop
+category: desktop
+builddeps:
+- golang
+rundeps:
+- cava
+- dgop
+- dsearch
+- matugen
+- qt6-multimedia
+- quickshell
+- wl-clipboard
+setup: '%patch -p1 -i ${pkgfiles}/dms-1.4.6-add-destdir-option.patch
+
+  '
+build: '%make PREFIX=/usr
+
+  '
+install: "%make_install \\\n    DESTDIR=${installdir} \\\n    PREFIX=/usr \\\n    SYSTEMD_USER_DIR=${installdir}/usr/lib/systemd/user\n\
+  %install_license LICENSE\n"
+patterns: []

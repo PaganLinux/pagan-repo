@@ -1,0 +1,34 @@
+name: devedeng
+version: 4.18.0
+release: 17
+source:
+- https://gitlab.com/rastersoft/devedeng/-/archive/4.18.0/devedeng-4.18.0.tar.bz2: 21b183dcd18592d95a986d564fed54fcfa17d8a565e8e057c7002077a06436dd
+homepage: https://www.rastersoft.com/programas/devede.html
+license: GPL-3.0-or-later
+summary: A program to create VideoDVDs and CDs
+description: 'Devede NG is a rewrite of the Devede DVD disc authoring program. This new code has been writen from scratch,
+  and uses Python3 and Gtk3. It is also cleaner, which will allow to add new features in the future.
+
+  '
+component: multimedia.video
+category: other
+builddeps:
+- python-build
+- python-installer
+- python-setuptools
+rundeps:
+- cdrtools
+- dvdauthor
+- libgtk-3
+- python-gobject
+- python-setuptools
+- python-urllib3
+- vcdimager
+setup: ''
+build: '%python3_setup
+
+  '
+install: '%python3_install
+
+  '
+patterns: []

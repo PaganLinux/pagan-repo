@@ -1,0 +1,75 @@
+name: displaycal
+version: 3.9.14
+release: 35
+source:
+- https://github.com/eoyilmaz/displaycal-py3/releases/download/3.9.14/DisplayCAL-3.9.14.tar.gz: d88e5f896812f67ec863f65ac9606f11a3f4b8d2005dfbe4caa41edaf2c53c9c
+homepage: https://displaycal.net/
+license: GPL-3.0-or-later
+summary: Display Calibration and Characterization powered by Argyll CMS
+description: 'DisplayCAL is a graphical user interface developed by Florian Höch for the display calibration and profiling
+  tools of Argyll CMS, an open source color management system developed by Graeme Gill.
+
+  Calibrate and characterize your display devices using one of the many supported hardware sensors, with support for multi-display
+  setups and a variety of available settings like customizable whitepoint, luminance, tone response curve as well as the option
+  to create matrix and look-up-table ICC profiles, with optional gamut mapping, as well as some proprietary 3D LUT formats.
+
+  '
+component: multimedia.graphics
+category: other
+builddeps:
+- pkgconfig(dri)
+- pkgconfig(python3)
+- pkgconfig(xinerama)
+- pkgconfig(xrandr)
+- pkgconfig(xxf86vm)
+- python-build
+- python-installer
+- python-setuptools
+- python-wheel
+rundeps:
+- argyllcms
+- numpy
+- pychromecast
+- python-distro
+- python-gobject
+- python-send2trash
+- wxPython
+setup: ''
+build: '# workaround broken setup.py file
+
+  install -Dm00644 misc/*.appdata.xml -t dist
+
+  cp misc/0install/debian.rules misc/
+
+
+  # Don''t build with pep517 as metainfo file doesn''t get filled in
+
+  rm -fr pyproject.toml setup.cfg
+
+
+  %python3_setup
+
+  '
+install: '%python3_install
+
+
+  # Use hwdata pnp.ids
+
+  rm -v $installdir/usr/share/DisplayCAL/pnp.ids
+
+
+  # Stateless
+
+  install -d $installdir/usr/share/xdg/autostart/
+
+  mv $installdir/{etc/xdg/autostart,usr/share/xdg/autostart}/z-displaycal-apply-profiles.desktop
+
+
+  # Cleanup empty directories
+
+  rm -fr $installdir/etc/
+
+  rm -fr $installdir/usr/share/DisplayCAL/tests
+
+  '
+patterns: []

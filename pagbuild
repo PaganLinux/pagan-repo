@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║               PAGBUILD v2 – Pagan Linux Package Build System               ║
+║     Bezpieczne budowanie w kontenerze – chroot, fakeroot, patchy, GPG      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+PRZEPIS (.pagrecipe.yml):
+─────────────────────────
+  name: mój-pakiet
+  version: 1.2.3
+  description: "Opis pakietu"
+  homepage: https://example.com
+  license: GPL-3.0
+  sources:
+    - https://example.com/pkg-1.2.3.tar.xz
+  sha256:
+    - abc123...
+  patches:                          # NOWE: lista patchy do nałożenia
+    - fix-build.patch
+    - musl-compat.patch
+  dependencies:
+    build: [gcc, make, cmake]       # sprawdzane na hoście
+    runtime: [glibc, libfoo]
+  build:
+    configure: ./configure --prefix=/usr
+    make: make -j$(nproc)
+    install: make DESTDIR=$PKG install
+    post_build: ldconfig            # opcjonalnie
+  hooks:
+    post_install: |
+      echo "Pakiet zainstalowany!"
+
+KLUCZOWE CECHY:
+  - --chroot: izolacja przez systemd-nspawn / bubblewrap / chroot
+  - fakeroot: pliki w pakiecie mają root:root
+  - Patchy: automatyczne nakładanie .patch przed budową
+  - sums.json: SHA256 każdego pliku (dla pag verify --deep)
+  - Bezpieczne: timeout 30min, blokada, weryfikacja GPG
+"""
+
+import os, sys, json, yaml, shutil, hashlib, tarfile, tempfile, subprocess, argparse, re
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+# =============================================================================
+# KONFIGURACJA
+# =============================================================================
+
+DEFAULT_REPO_URL = "https://repo.paganlinux.eu/stable"
+CACHE_DIR        = "/var/cache/pagbuild/sources"
+OUTPUT_DIR       = "/var/cache/pagbuild/output"
+CHROOT_BASE      = "/var/lib/pagbuild/chroot"
+
+# Wymagane narzędzia
+REQUIRED_TOOLS = ["gcc", "make", "tar", "xz"]
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""): h.update(chunk)
+    return h.hexdigest()
+
+def _sha256_dir(directory: str) -> Dict[str, str]:
+    """Generuje sums.json – SHA256 dla każdego pliku w katalogu."""
+    sums = {}
+    for root, dirs, files in os.walk(directory):
+        for fname in files:
+            full = os.path.join(root, fname)
+            rel = "/" + os.path.relpath(full, directory)
+            try:
+                sums[rel] = _sha256_file(full)
+            except Exception:
+                sums[rel] = "ERROR"
+    return sums
+
+# =============================================================================
+# WALIDACJA PRZEPISU
+# =============================================================================
+
+def load_recipe(path: str) -> dict:
+    with open(path) as f:
+        recipe = yaml.safe_load(f)
+    required = ["name", "version", "sources", "build"]
+    for key in required:
+        if key not in recipe:
+            raise ValueError(f"Missing required field '{key}' in recipe")
+    if "install" not in recipe.get("build", {}):
+        raise ValueError("Recipe must contain 'build.install'")
+    # Normalizuj
+    if isinstance(recipe.get("sources"), str):
+        recipe["sources"] = [recipe["sources"]]
+    if isinstance(recipe.get("sha256"), str):
+        recipe["sha256"] = [recipe["sha256"]]
+    if isinstance(recipe.get("patches"), str):
+        recipe["patches"] = [recipe["patches"]]
+    return recipe
+
+# =============================================================================
+# CHROOT / KONTENER
+# =============================================================================
+
+def _detect_isolation_method() -> str:
+    """Wykrywa dostępną metodę izolacji: nspawn > bubblewrap > chroot > none."""
+    if shutil.which("systemd-nspawn"):
+        return "nspawn"
+    if shutil.which("bwrap"):
+        return "bwrap"
+    if shutil.which("chroot"):
+        return "chroot"
+    return "none"
+
+def _run_isolated(command: str, build_dir: str, pkg_dir: str, env: dict,
+                   isolation: str, timeout: int = 1800) -> subprocess.CompletedProcess:
+    """
+    Uruchamia komendę w izolowanym środowisku.
+    - nspawn: systemd-nspawn z bind-mount
+    - bwrap:  bubblewrap (flatpak)
+    - chroot: klasyczny chroot (wymaga root)
+    - none:   bezpośrednio na hoście (⚠ niebezpieczne)
+    """
+    if isolation == "nspawn":
+        # systemd-nspawn – pełna izolacja kontenerowa
+        cmd = [
+            "systemd-nspawn", "--quiet",
+            "--bind", f"{build_dir}:/build",
+            "--bind", f"{pkg_dir}:/pkg",
+            "--directory", "/",
+            "--setenv", f"BUILD_DIR=/build",
+            "--setenv", f"PKG=/pkg",
+            "--setenv", f"PKG_NAME={env.get('PKG_NAME','')}",
+            "--setenv", f"PKG_VERSION={env.get('PKG_VERSION','')}",
+            "--chdir=/build",
+            "/bin/bash", "-c", command,
+        ]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+    elif isolation == "bwrap":
+        # bubblewrap – lekka izolacja (nie wymaga root)
+        cmd = [
+            "bwrap",
+            "--ro-bind", "/usr", "/usr",
+            "--ro-bind", "/lib", "/lib",
+            "--ro-bind", "/lib64", "/lib64",
+            "--ro-bind", "/bin", "/bin",
+            "--ro-bind", "/sbin", "/sbin",
+            "--ro-bind", "/etc", "/etc",
+            "--bind", build_dir, "/build",
+            "--bind", pkg_dir, "/pkg",
+            "--chdir", "/build",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--unshare-all",
+            "/bin/bash", "-c", command,
+        ]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+    elif isolation == "chroot":
+        # Klasyczny chroot – potrzebuje roota + przygotowanego katalogu
+        chroot_dir = os.path.join(CHROOT_BASE, "rootfs")
+        if not os.path.exists(os.path.join(chroot_dir, "bin/bash")):
+            print("  ⚠ Chroot nie jest przygotowany. Uruchom 'pagbuild --setup-chroot'")
+            return subprocess.CompletedProcess([], 1, "", "chroot not ready")
+
+        # Bind-mount katalogów do chroot
+        bind_build = os.path.join(chroot_dir, "build")
+        bind_pkg = os.path.join(chroot_dir, "pkg")
+        os.makedirs(bind_build, exist_ok=True)
+        os.makedirs(bind_pkg, exist_ok=True)
+
+        subprocess.run(["mount", "--bind", build_dir, bind_build], check=False)
+        subprocess.run(["mount", "--bind", pkg_dir, bind_pkg], check=False)
+
+        try:
+            cmd_full = f"export BUILD_DIR=/build PKG=/pkg PKG_NAME={env.get('PKG_NAME','')} PKG_VERSION={env.get('PKG_VERSION','')}; cd /build; {command}"
+            result = subprocess.run(
+                ["chroot", chroot_dir, "/bin/bash", "-c", cmd_full],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        finally:
+            subprocess.run(["umount", bind_pkg], check=False)
+            subprocess.run(["umount", bind_build], check=False)
+        return result
+
+    else:
+        # Bez izolacji – tylko dewelopersko!
+        print("  ⚠ BRAK IZOLACJI – budowanie bezpośrednio na hoście!", flush=True)
+        return subprocess.run(
+            command, shell=True, cwd=build_dir,
+            env=env, capture_output=True, text=True, timeout=timeout,
+        )
+
+# =============================================================================
+# FAKEROOT
+# =============================================================================
+
+def _wrap_fakeroot(command: str) -> str:
+    """Opakowuje komendę w fakeroot jeśli dostępny (zapewnia root:root w pakiecie)."""
+    if shutil.which("fakeroot"):
+        return f"fakeroot -- {command}"
+    return command
+
+# =============================================================================
+# PAGBUILDER
+# =============================================================================
+
+class PagBuilder:
+    def __init__(self, chroot=False, repo_url="", push=False, sign_key=""):
+        self.use_chroot = chroot
+        self.repo_url = repo_url or os.environ.get("PAGBUILD_REPO_URL", DEFAULT_REPO_URL)
+        self.push = push
+        self.sign_key = sign_key or os.environ.get("PAGBUILD_GPG_KEY", "")
+        self._build_dir = ""
+        self._pkg_dir = ""
+        self._isolation = _detect_isolation_method() if chroot else "none"
+
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    def build(self, recipe_path: str) -> Tuple[bool, str]:
+        recipe = load_recipe(recipe_path)
+        name, version = recipe["name"], recipe["version"]
+        pkg_filename = f"{name}-{version}.pkg.tar.xz"
+        pkg_path = os.path.join(OUTPUT_DIR, pkg_filename)
+
+        print(f"\n{'='*60}")
+        print(f"📦 Budowanie: {name}-{version}")
+        print(f"   Izolacja: {self._isolation}{' + fakeroot' if shutil.which('fakeroot') else ''}")
+        print(f"{'='*60}")
+
+        # [1] Sprawdź zależności
+        print("\n[1/8] Sprawdzanie zależności build-time...")
+        ok, missing = self._check_build_deps(recipe)
+        if not ok:
+            return False, f"Brak zależności: {', '.join(missing)}"
+        print(f"  ✅ Wszystkie zależności dostępne")
+
+        # [2] Pobierz źródła
+        print("\n[2/8] Pobieranie źródeł...")
+        sources_dir = self._download_sources(recipe)
+        if not sources_dir:
+            return False, "Błąd pobierania źródeł"
+        print(f"  ✅ Źródła w {sources_dir}")
+
+        # [3] Rozpakuj + nałóż patchy
+        print("\n[3/8] Rozpakowywanie + patchy...")
+        self._build_dir = self._extract_and_patch(recipe, sources_dir)
+        print(f"  ✅ Katalog roboczy: {self._build_dir}")
+
+        # [4] Build
+        print("\n[4/8] Budowanie...")
+        self._pkg_dir = tempfile.mkdtemp(prefix="pagbuild-pkg-")
+        ok = self._run_build(recipe)
+        if not ok:
+            return False, "Błąd budowania"
+        print(f"  ✅ Zbudowano → $PKG = {self._pkg_dir}")
+
+        # [5] Generuj sums.json (SHA256 per plik)
+        print("\n[5/8] Generowanie sums.json...")
+        sums = _sha256_dir(self._pkg_dir)
+        sums_path = os.path.join(self._pkg_dir, "sums.json")
+        with open(sums_path, "w") as f:
+            json.dump(sums, f, indent=2)
+        print(f"  ✅ {len(sums)} plików z sumami SHA256")
+
+        # [6] Stwórz data.tar.xz (z root:root przez fakeroot lub tar --owner)
+        print("\n[6/8] Pakowanie data.tar.xz...")
+        data_tmp = tempfile.mkdtemp(prefix="pagbuild-data-")
+        data_path = os.path.join(data_tmp, "data.tar.xz")
+        self._create_tar_root(data_path, self._pkg_dir)
+        data_size = os.path.getsize(data_path)
+        print(f"  ✅ {data_size/1048576:.1f} MB")
+
+        # [7] Generuj metadata.json + podpisz GPG
+        print("\n[7/8] Generowanie metadanych...")
+        metadata = self._generate_metadata(recipe, data_path)
+        meta_tmp = tempfile.mkdtemp(prefix="pagbuild-meta-")
+        meta_path = os.path.join(meta_tmp, "metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        # [8] Pakuj .pkg.tar.xz + .sig
+        print("\n[8/8] Tworzenie .pkg.tar.xz...")
+        hooks_dir = self._prepare_hooks(recipe)
+        self._create_package(pkg_path, data_path, meta_path, hooks_dir)
+        pkg_size = os.path.getsize(pkg_path)
+        print(f"  ✅ {pkg_path} ({pkg_size/1048576:.1f} MB)")
+
+        # Podpisz GPG
+        if self.sign_key:
+            sig_path = pkg_path + ".sig"
+            r = subprocess.run(
+                ["gpg", "--detach-sign", "--armor", "--local-user", self.sign_key,
+                 "--output", sig_path, pkg_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                print(f"  🔐 Podpisano: {sig_path}")
+            else:
+                print(f"  ⚠ Błąd podpisu: {r.stderr[:80]}")
+
+        # Push na repo
+        if self.push:
+            print(f"\n🚀 Wysyłanie na {self.repo_url}...")
+            ok_push = self._push_to_repo(pkg_path, metadata)
+            if not ok_push:
+                print("  ⚠ Błąd wysyłania (pakiet zbudowany lokalnie)")
+            else:
+                print("  ✅ Wysłano!")
+                # Wyślij też .sig jeśli istnieje
+                sig = pkg_path + ".sig"
+                if os.path.exists(sig):
+                    self._push_to_repo(sig, {})
+
+        print(f"\n{'='*60}")
+        print(f"✅ PAKIET GOTOWY: {pkg_path}")
+        print(f"{'='*60}")
+        return True, pkg_path
+
+    # -----------------------------------------------------------------
+
+    def _check_build_deps(self, recipe: dict) -> Tuple[bool, List[str]]:
+        """Sprawdza rzeczywistą dostępność zależności build-time na hoście."""
+        deps = recipe.get("dependencies", {}).get("build", [])
+        missing = []
+
+        for dep in deps:
+            found = False
+
+            # 1. Sprawdź czy jest jako komenda w PATH
+            if shutil.which(dep):
+                found = True
+
+            # 2. Sprawdź pkg-config
+            if not found:
+                try:
+                    r = subprocess.run(["pkg-config", "--exists", dep],
+                                       capture_output=True, timeout=5)
+                    if r.returncode == 0:
+                        found = True
+                except Exception:
+                    pass
+
+            # 3. Sprawdź nagłówki/pliki .pc
+            if not found:
+                for prefix in ["/usr/lib/pkgconfig", "/usr/share/pkgconfig",
+                               "/usr/lib64/pkgconfig"]:
+                    if os.path.exists(os.path.join(prefix, f"{dep}.pc")):
+                        found = True
+                        break
+
+            # 4. Sprawdź czy plik biblioteki istnieje (dla -dev)
+            if not found:
+                for libdir in ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"]:
+                    if os.path.exists(os.path.join(libdir, f"lib{dep}.so")):
+                        found = True
+                        break
+
+            if not found:
+                missing.append(dep)
+
+        return len(missing) == 0, missing
+
+    def _download_sources(self, recipe: dict) -> Optional[str]:
+        sources = recipe.get("sources", [])
+        sha256s = recipe.get("sha256", [])
+        tmpdir = tempfile.mkdtemp(prefix="pagbuild-src-")
+
+        for i, url in enumerate(sources):
+            fname = os.path.basename(url.split("?")[0].split("#")[0])
+            dest = os.path.join(tmpdir, fname)
+            cached = os.path.join(CACHE_DIR, fname)
+            expected_sha = sha256s[i] if i < len(sha256s) else ""
+
+            # Sprawdź cache
+            if os.path.exists(cached):
+                if not expected_sha or _sha256_file(cached) == expected_sha:
+                    shutil.copy2(cached, dest)
+                    print(f"  ✓ {fname} (z cache)")
+                    continue
+
+            print(f"  ↓ {fname} ({expected_sha[:12] if expected_sha else '?'}) ...", end=" ", flush=True)
+            try:
+                result = subprocess.run(
+                    ["wget", "-q", "--show-progress", "-O", dest, url],
+                    timeout=600, capture_output=True,
+                )
+                if result.returncode != 0:
+                    print("❌"); return None
+
+                if expected_sha and _sha256_file(dest) != expected_sha:
+                    print(f"❌ SHA256 mismatch!"); return None
+
+                shutil.copy2(dest, cached)
+                print("✓")
+            except Exception as e:
+                print(f"❌ ({e})"); return None
+
+        return tmpdir
+
+    def _extract_and_patch(self, recipe: dict, sources_dir: str) -> str:
+        """Rozpakowuje źródła i nakłada patchy."""
+        workdir = tempfile.mkdtemp(prefix="pagbuild-work-")
+
+        for fname in os.listdir(sources_dir):
+            fpath = os.path.join(sources_dir, fname)
+            try:
+                if fname.endswith(".tar.xz"):
+                    with tarfile.open(fpath, "r:xz") as tf: tf.extractall(workdir, filter='data')
+                elif fname.endswith(".tar.gz") or fname.endswith(".tgz"):
+                    with tarfile.open(fpath, "r:gz") as tf: tf.extractall(workdir, filter='data')
+                elif fname.endswith(".tar.bz2"):
+                    with tarfile.open(fpath, "r:bz2") as tf: tf.extractall(workdir, filter='data')
+                elif fname.endswith(".zip"):
+                    shutil.unpack_archive(fpath, workdir, "zip")
+                else:
+                    shutil.copy2(fpath, workdir)
+            except Exception as e:
+                print(f"  ⚠ Nie można rozpakować {fname}: {e}")
+                shutil.copy2(fpath, workdir)
+
+        # Autodetekcja podkatalogu
+        items = os.listdir(workdir)
+        if len(items) == 1 and os.path.isdir(os.path.join(workdir, items[0])):
+            workdir = os.path.join(workdir, items[0])
+
+        # Nakładanie patchy
+        patches = recipe.get("patches", [])
+        if patches:
+            print(f"  🩹 Nakładanie {len(patches)} patchy...")
+            for patch_file in patches:
+                patch_path = os.path.join(os.path.dirname(recipe.get("_recipe_dir", "")), patch_file)
+                if not os.path.exists(patch_path):
+                    print(f"  ⚠ Patch nie znaleziony: {patch_file}"); continue
+                print(f"     {patch_file} ...", end=" ", flush=True)
+                r = subprocess.run(
+                    ["patch", "-p1", "-i", patch_path],
+                    cwd=workdir, capture_output=True, text=True, timeout=30,
+                )
+                if r.returncode == 0:
+                    print("✓")
+                else:
+                    print(f"❌ {r.stderr[:80]}")
+                    return ""  # błąd krytyczny – patch się nie nałożył
+
+        return workdir
+
+    def _run_build(self, recipe: dict) -> bool:
+        build = recipe["build"]
+        env = os.environ.copy()
+        env["PKG"] = self._pkg_dir
+        env["PKG_NAME"] = recipe["name"]
+        env["PKG_VERSION"] = recipe["version"]
+        env["BUILD_DIR"] = self._build_dir
+        env["DESTDIR"] = self._pkg_dir
+
+        steps = [
+            ("configure", build.get("configure", "")),
+            ("make", build.get("make", "")),
+            ("install", build.get("install", "")),
+            ("post_build", build.get("post_build", "")),
+        ]
+
+        for step_name, command in steps:
+            if not command:
+                continue
+
+            # Instalacja zawsze przez fakeroot
+            if step_name == "install":
+                command = _wrap_fakeroot(command)
+
+            print(f"  [{step_name}] {command[:80]}...", end=" ", flush=True)
+
+            if self._isolation != "none":
+                result = _run_isolated(
+                    command, self._build_dir, self._pkg_dir,
+                    env, self._isolation, timeout=1800,
+                )
+            else:
+                try:
+                    result = subprocess.run(
+                        command, shell=True, cwd=self._build_dir,
+                        env=env, capture_output=True, text=True, timeout=1800,
+                    )
+                except subprocess.TimeoutExpired:
+                    print("⏰ (timeout)"); return False
+                except Exception as e:
+                    print(f"❌ ({e})"); return False
+
+            if result.returncode != 0:
+                print("❌")
+                stderr = (result.stderr or "")[-500:]
+                if stderr:
+                    print(f"  ----- stderr -----\n{stderr}")
+                return False
+            print("✓")
+
+        return True
+
+    def _generate_metadata(self, recipe: dict, data_path: str) -> dict:
+        runtime_deps = recipe.get("dependencies", {}).get("runtime", [])
+        data_size = os.path.getsize(data_path)
+        data_sha = _sha256_file(data_path)
+
+        return {
+            "name": recipe["name"],
+            "version": recipe["version"],
+            "description": recipe.get("description", ""),
+            "homepage": recipe.get("homepage", ""),
+            "license": recipe.get("license", "unknown"),
+            "dependencies": runtime_deps,
+            "build_dependencies": recipe.get("dependencies", {}).get("build", []),
+            "size": data_size,
+            "sha256": data_sha,
+            "gpg_fingerprint": self.sign_key,
+            "build_date": datetime.now().strftime("%Y-%m-%d"),
+            "built_by": "pagbuild v2",
+            "isolation": self._isolation,
+        }
+
+    def _prepare_hooks(self, recipe: dict) -> str:
+        """Przygotowuje katalog hooks/ ze skryptami."""
+        hooks_dir = tempfile.mkdtemp(prefix="pagbuild-hooks-")
+        hooks = recipe.get("hooks", {})
+
+        for hook_name in ["pre-install", "post-install", "pre-remove", "post-remove"]:
+            script = hooks.get(hook_name, "")
+            if script:
+                hook_path = os.path.join(hooks_dir, hook_name)
+                with open(hook_path, "w") as f:
+                    f.write("#!/bin/bash\n")
+                    f.write(script)
+                os.chmod(hook_path, 0o755)
+
+        return hooks_dir if os.listdir(hooks_dir) else ""
+
+    def _create_tar_root(self, tar_path: str, source_dir: str):
+        """Tworzy archiwum tar.xz z własnością root:root."""
+        # Użyj tar --owner=root --group=root
+        result = subprocess.run(
+            ["tar", "-cJf", tar_path,
+             "--owner=root", "--group=root",
+             "-C", source_dir, "."],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            # Fallback: Python tarfile
+            with tarfile.open(tar_path, "w:xz") as tf:
+                for root, dirs, files in os.walk(source_dir):
+                    for fname in files:
+                        full = os.path.join(root, fname)
+                        arcname = os.path.relpath(full, source_dir)
+                        ti = tf.gettarinfo(full, arcname)
+                        ti.uid = 0; ti.gid = 0; ti.uname = "root"; ti.gname = "root"
+                        with open(full, "rb") as fh:
+                            tf.addfile(ti, fh)
+
+    def _create_package(self, pkg_path: str, data_path: str,
+                          meta_path: str, hooks_dir: str):
+        """Tworzy końcowy plik .pkg.tar.xz z odpowiednią strukturą."""
+        with tarfile.open(pkg_path, "w:xz") as tf:
+            # data.tar.xz
+            ti = tf.gettarinfo(data_path, "data.tar.xz")
+            ti.uid = 0; ti.gid = 0
+            with open(data_path, "rb") as f:
+                tf.addfile(ti, f)
+
+            # metadata.json
+            ti = tf.gettarinfo(meta_path, "metadata.json")
+            ti.uid = 0; ti.gid = 0
+            with open(meta_path, "rb") as f:
+                tf.addfile(ti, f)
+
+            # hooks/
+            if hooks_dir and os.path.isdir(hooks_dir):
+                for fname in os.listdir(hooks_dir):
+                    full = os.path.join(hooks_dir, fname)
+                    ti = tf.gettarinfo(full, f"hooks/{fname}")
+                    ti.uid = 0; ti.gid = 0; ti.mode = 0o755
+                    with open(full, "rb") as f:
+                        tf.addfile(ti, f)
+
+    def _push_to_repo(self, pkg_path: str, metadata: dict) -> bool:
+        fname = os.path.basename(pkg_path)
+
+        # SCP
+        scp_target = os.environ.get("PAGBUILD_SCP_TARGET", "")
+        if scp_target:
+            try:
+                r = subprocess.run(
+                    ["scp", "-q", pkg_path, f"{scp_target}/{fname}"],
+                    timeout=120, capture_output=True,
+                )
+                if r.returncode == 0:
+                    return True
+            except Exception:
+                pass
+
+        # curl upload
+        try:
+            import urllib.request
+            url = f"{self.repo_url}/upload"
+            boundary = "----PagBuildUpload"
+            body = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="package"; filename="{fname}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode()
+            with open(pkg_path, "rb") as f:
+                body += f.read()
+            body += f"\r\n--{boundary}--\r\n".encode()
+            req = urllib.request.Request(url, data=body, headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "X-PagBuild-Token": os.environ.get("PAGBUILD_TOKEN", ""),
+            })
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception as e:
+            print(f"  ⚠ Upload failed: {e}")
+        return False
+
+# =============================================================================
+# BATCH
+# =============================================================================
+
+def batch_build(recipes_dir, chroot=False, repo_url="", push=False, sign_key=""):
+    recipes = sorted(Path(recipes_dir).glob("*.yml")) + sorted(Path(recipes_dir).glob("*.yaml"))
+    if not recipes:
+        print(f"❌ Brak przepisów w {recipes_dir}"); return 1
+
+    builder = PagBuilder(chroot=chroot, repo_url=repo_url, push=push, sign_key=sign_key)
+    failed = []
+    for i, rp in enumerate(recipes, 1):
+        print(f"\n{'#'*60}")
+        print(f"# [{i}/{len(recipes)}] {rp.name}")
+        print(f"{'#'*60}")
+        ok, result = builder.build(str(rp))
+        if not ok:
+            failed.append((rp.name, result))
+
+    print(f"\n{'='*60}")
+    if failed:
+        print(f"❌ NIEPOWODZENIA ({len(failed)}/{len(recipes)}):")
+        for name, err in failed:
+            print(f"  ❌ {name}: {err}")
+        return 1
+    print(f"✅ Wszystkie {len(recipes)} pakietów zbudowane!")
+    return 0
+
+# =============================================================================
+# SETUP CHROOT
+# =============================================================================
+
+def cmd_setup_chroot():
+    """Przygotowuje katalog chroot do budowania (kopiuje binaria + zależności .so)."""
+    chroot_dir = os.path.join(CHROOT_BASE, "rootfs")
+    if os.path.exists(os.path.join(chroot_dir, "bin/bash")):
+        print(f"✅ Chroot już istnieje: {chroot_dir}")
+        print("   Aby przebudować: rm -rf " + chroot_dir)
+        return
+
+    print(f"🔧 Przygotowanie chroot w {chroot_dir}...")
+    os.makedirs(chroot_dir, exist_ok=True)
+
+    # Lista narzędzi do skopiowania (binaria + ich zależności)
+    tools = []
+    for t in ["/bin/bash", "/bin/sh", "/usr/bin/make", "/usr/bin/gcc",
+              "/usr/bin/g++", "/usr/bin/install", "/usr/bin/find",
+              "/usr/bin/tar", "/usr/bin/xz", "/usr/bin/patch",
+              "/usr/bin/ld", "/usr/bin/strip", "/usr/bin/pkg-config"]:
+        if os.path.exists(t):
+            tools.append(t)
+
+    # Zbierz wszystkie potrzebne biblioteki przez ldd
+    all_libs = set()
+    copied_bins = set()
+
+    for tool in tools:
+        _copy_with_deps(tool, chroot_dir, all_libs, copied_bins)
+
+    # Dodaj dynamiczny linker (ld-linux) - nie jest wykrywany przez ldd
+    if os.path.exists("/lib64/ld-linux-x86-64.so.2"):
+        _copy_with_deps("/lib64/ld-linux-x86-64.so.2", chroot_dir, all_libs, copied_bins)
+    elif os.path.exists("/lib/ld-linux.so.2"):
+        _copy_with_deps("/lib/ld-linux.so.2", chroot_dir, all_libs, copied_bins)
+
+    # Dodatkowe katalogi
+    for d in ["/dev", "/proc", "/sys", "/tmp", "/etc"]:
+        dest = os.path.join(chroot_dir, d.lstrip("/"))
+        os.makedirs(dest, exist_ok=True)
+
+    # Skopiuj /etc/resolv.conf dla DNS w chroot
+    # Uwaga: W nowoczesnych systemach może to być symlink do /run/systemd/resolve/stub-resolv.conf
+    # Dla pełnej kompatybilności, kopiujemy zawartość, a nie sam symlink
+    if os.path.exists("/etc/resolv.conf"):
+        resolv_src = "/etc/resolv.conf"
+        resolv_dst = os.path.join(chroot_dir, "etc/resolv.conf")
+        # Jeśli to symlink, skopiuj docelowy plik
+        if os.path.islink(resolv_src):
+            real_resolv = os.path.realpath(resolv_src)
+            if os.path.exists(real_resolv):
+                shutil.copy2(real_resolv, resolv_dst)
+            else:
+                # Jeśli docelowy plik nie istnieje, skopiuj symlink jako symlink
+                shutil.copy2(resolv_src, resolv_dst)
+        else:
+            shutil.copy2(resolv_src, resolv_dst)
+
+    print(f"✅ Chroot gotowy: {len(copied_bins)} binariów, {len(all_libs)} bibliotek")
+    print(f"   Użyj: pagbuild --chroot przepis.yml")
+
+
+def _copy_with_deps(binary: str, chroot_dir: str, all_libs: set, copied_bins: set):
+    """Kopiuje binarkę i wszystkie jej zależności biblioteczne (ldd)."""
+    if binary in copied_bins:
+        return
+    dest = os.path.join(chroot_dir, binary.lstrip("/"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+    # Rozwiąż symlink
+    real_path = os.path.realpath(binary)
+    if real_path != binary:
+        if real_path not in copied_bins:
+            real_dest = os.path.join(chroot_dir, real_path.lstrip("/"))
+            os.makedirs(os.path.dirname(real_dest), exist_ok=True)
+            shutil.copy2(real_path, real_dest)
+            copied_bins.add(real_path)
+        # Utwórz symlink
+        if not os.path.exists(dest):
+            rel_target = os.path.relpath(real_path, os.path.dirname(binary))
+            os.symlink(rel_target, dest)
+    else:
+        shutil.copy2(binary, dest)
+    copied_bins.add(binary)
+
+    # Znajdź zależności przez ldd
+    try:
+        result = subprocess.run(["ldd", binary], capture_output=True, text=True, timeout=10)
+        for line in result.stdout.split("\n"):
+            # Format: "   libfoo.so.1 => /usr/lib/libfoo.so.1 (0x7f...)"
+            m = re.search(r'=>\s+(/\S+)', line)
+            if m:
+                lib_path = m.group(1)
+                if lib_path not in all_libs:
+                    all_libs.add(lib_path)
+                    lib_dest = os.path.join(chroot_dir, lib_path.lstrip("/"))
+                    os.makedirs(os.path.dirname(lib_dest), exist_ok=True)
+
+                    real_lib = os.path.realpath(lib_path)
+                    if real_lib != lib_path:
+                        real_lib_dest = os.path.join(chroot_dir, real_lib.lstrip("/"))
+                        os.makedirs(os.path.dirname(real_lib_dest), exist_ok=True)
+                        if not os.path.exists(real_lib_dest):
+                            shutil.copy2(real_lib, real_lib_dest)
+                        if not os.path.exists(lib_dest):
+                            # For chroot, use absolute paths relative to chroot root for reliability
+                            # This avoids issues with different directory structures (e.g., usrmerge)
+                            chroot_real_path = "/" + real_lib.lstrip("/")
+                            os.symlink(chroot_real_path, lib_dest)
+                    else:
+                        shutil.copy2(lib_path, lib_dest)
+    except Exception:
+        pass
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="pagbuild v2 – Pagan Linux Package Build System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+PRZYKŁADY:
+  pagbuild pakiet.yml                     Buduje pakiet na hoście
+  pagbuild --chroot pakiet.yml            Buduje w izolowanym kontenerze
+  pagbuild --push --sign-key KEY pakiet   Buduje, podpisuje, wysyła na repo
+  pagbuild --batch ./recipes/             Buduje wszystkie przepisy
+  pagbuild --setup-chroot                 Przygotowuje środowisko chroot
+
+PRZEPIS (.pagrecipe.yml):
+  name: mojpakiet
+  version: "1.0"
+  sources: [https://...]
+  sha256: [abc123...]
+  patches: [fix.patch]               # NOWE: patchy
+  dependencies:
+    build: [gcc, make, cmake]
+    runtime: [glibc]
+  build:
+    configure: ./configure --prefix=/usr
+    make: make -j$(nproc)
+    install: make DESTDIR=$PKG install  # fakeroot automatycznie!
+  hooks:
+    post_install: echo "Gotowe!"       # NOWE: hooki
+        """,
+    )
+    parser.add_argument("recipe", nargs="?", help="Ścieżka do przepisu")
+    parser.add_argument("--chroot", action="store_true", help="Buduj w izolowanym kontenerze")
+    parser.add_argument("--push", action="store_true", help="Wyślij na repo")
+    parser.add_argument("--batch", metavar="DIR", help="Buduj wszystkie przepisy z katalogu")
+    parser.add_argument("--repo-url", metavar="URL", help="URL repozytorium")
+    parser.add_argument("--sign-key", metavar="KEY", help="Klucz GPG do podpisu")
+    parser.add_argument("--setup-chroot", action="store_true", help="Przygotuj środowisko chroot")
+    parser.add_argument("--env", metavar="K=V", action="append", help="Zmienne środowiskowe")
+
+    args = parser.parse_args()
+
+    if args.setup_chroot:
+        cmd_setup_chroot()
+        return
+
+    if args.env:
+        for item in args.env:
+            k, _, v = item.partition("=")
+            os.environ[k] = v
+
+    if args.batch:
+        sys.exit(batch_build(args.batch, args.chroot, args.repo_url or "",
+                             args.push, args.sign_key or ""))
+
+    if not args.recipe:
+        parser.print_help()
+        sys.exit(1)
+
+    builder = PagBuilder(chroot=args.chroot, repo_url=args.repo_url or "",
+                         push=args.push, sign_key=args.sign_key or "")
+    ok, result = builder.build(args.recipe)
+    sys.exit(0 if ok else 1)
+
+if __name__ == "__main__":
+    main()

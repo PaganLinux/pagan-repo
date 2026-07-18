@@ -1,0 +1,92 @@
+name: docbook-xml
+version: '4.5'
+release: 11
+source:
+- https://www.docbook.org/xml/4.5/docbook-xml-4.5.zip: 4e4e037a2b83c98c6c94818390d4bdd3f6e10f6ec62dd79188594e26190dc7b4
+- https://github.com/docbook/xslt10-stylesheets/releases/download/release%2F1.79.2/docbook-xsl-nons-1.79.2.tar.bz2: ee8b9eca0b7a8f89075832a2da7534bce8c5478fc8fc2676f512d5d87d832102
+- https://github.com/docbook/xslt10-stylesheets/releases/download/release%2F1.79.2/docbook-xsl-1.79.2.tar.bz2: 316524ea444e53208a2fb90eeb676af755da96e1417835ba5f5eb719c81fa371
+- https://www.docbook.org/sgml/4.5/docbook-4.5.zip: 8043e514e80c6c19cb146b5d37937d1305bf3abf9b0097c36df7f70f611cdf43
+homepage: https://docbook.org/
+license: GPL-3.0-or-later
+summary: XML data files for DocBook
+description: 'The DocBook XML DTD-4.5 package contains document type definitions for verification of XML data files against
+  the DocBook rule set. These are useful for structuring books and software documentation to a standard allowing you to utilize
+  transformations already written for that standard.
+
+  '
+component: programming
+category: tools
+builddeps:
+- docbook-xml
+rundeps: []
+setup: ''
+build: ''
+install: "root=\"/usr/share/xml/docbook/xml-dtd-${version}\"\nfull_root=\"${installdir}/${root}\"\n\ninstall -D -m 00644 docbook.cat\
+  \ \"${full_root}/docbook.cat\"\ninstall -m 00644 *.dtd \"${full_root}\"\ninstall -m 00644 *.mod \"${full_root}\"\ncp -Rv\
+  \ ent/ \"${full_root}/.\"\ninstall -D -d -m 00755 \"${installdir}/etc/xml\"\n\nmkdir docbook-sgml && pushd docbook-sgml\n\
+  unzip $sources/docbook-${version}.zip\nsed -i -e '/ISO 8879/d' -e '/gml/d' docbook.cat\ninstall -v -d  $installdir/usr/share/sgml/docbook/sgml-dtd-4.5\n\
+  install -v docbook.cat $installdir/usr/share/sgml/docbook/sgml-dtd-4.5/catalog\ncp -v -af *.dtd *.mod *.dcl  $installdir/usr/share/sgml/docbook/sgml-dtd-4.5\n\
+  \nunset version\n\ncat >> ${installdir}/usr/share/sgml/docbook/sgml-dtd-4.5/catalog << \"EOF\"\n-- Begin Single Major Version\
+  \ catalog changes --\n\nPUBLIC \"-//OASIS//DTD DocBook V4.4//EN\" \"docbook.dtd\"\nPUBLIC \"-//OASIS//DTD DocBook V4.3//EN\"\
+  \ \"docbook.dtd\"\nPUBLIC \"-//OASIS//DTD DocBook V4.2//EN\" \"docbook.dtd\"\nPUBLIC \"-//OASIS//DTD DocBook V4.1//EN\"\
+  \ \"docbook.dtd\"\nPUBLIC \"-//OASIS//DTD DocBook V4.0//EN\" \"docbook.dtd\"\n\n-- End Single Major Version catalog changes\
+  \ --\nEOF\n\nmkdir -p ${installdir}/etc/sgml\necho 'CATALOG \"/usr/share/sgml/docbook/sgml-dtd-4.5/catalog\"' > ${installdir}/etc/sgml/catalog\n\
+  popd # docbook-sgml\n\ndocbookVersion=\"1.79.2\"\n_install_docbook() {\n    src=\"$1\"\n    kind=\"$2\"\n\n    tar xvf \"\
+  ${sources}/docbook-${src}-${docbookVersion}.tar.bz2\"\n    root=\"/usr/share/xml/docbook/${kind}-stylesheets-${docbookVersion}\"\
+  \n    full_root=\"${installdir}/${root}\"\n\n    pushd \"docbook-${src}-${docbookVersion}\"\n    %patch -p2 -i $pkgfiles/docbook-style-${kind}-non-recursive-string-subst.patch\n\
+  \n    install -d -D -m 00755 \"${full_root}\"\n\n    for item in VERSION common eclipse epub extensions fo highlighting\
+  \ html \\\n    htmlhelp images javahelp lib manpages params profiling \\\n    roundtrip slides template tests tools webhelp\
+  \ website \\\n    xhtml xhtml-1_1 ; \\\n    do\n    cp -Rv \"${item}\" \"${full_root}/.\"\n    done\n\n    # Create the\
+  \ .xsl symlink\n    ln -sv \"${root}/VERSION\" \"${full_root}/VERSION.xsl\"\n    popd\n}\n_install_docbook \"xsl-nons\"\
+  \ \"xsl\"\n_install_docbook \"xsl\"      \"xsl-ns\"\n\nmkdir -p $installdir/etc/xml\n\nxmlCatalogFile=\"${installdir}/etc/xml/catalog\"\
+  \ndocbookFile=\"${installdir}/etc/xml/docbook\"\nxmlcatalog  --noout --create $installdir/etc/xml/docbook\nxmlcatalog  --noout\
+  \ --create $installdir/etc/xml/catalog\nXML_CATALOG_FILES=$installdir/etc/xml/docbook  xmlcatalog --add \"public\" \"-//OASIS//DTD\
+  \ DocBook XML V4.5//EN\" \"http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd\" $installdir/etc/xml/docbook\nXML_CATALOG_FILES=$installdir/etc/xml/docbook\
+  \  xmlcatalog --add \"public\" \"-//OASIS//DTD DocBook XML CALS Table Model V4.5//EN\" \"file:///usr/share/xml/docbook/xml-dtd-4.5/calstblx.dtd\"\
+  \ $installdir/etc/xml/docbook\n\nexport XML_CATALOG_FILES=$installdir/etc/xml/docbook\nxmlcatalog --noout --add \"public\"\
+  \ \\\n\"-//OASIS//DTD DocBook XML V4.5//EN\" \\\n\"http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd\" \\\n$docbookFile\n\
+  xmlcatalog --noout --add \"public\" \\\n\"-//OASIS//DTD DocBook XML CALS Table Model V4.5//EN\" \\\n\"file:///usr/share/xml/docbook/xml-dtd-4.5/calstblx.dtd\"\
+  \ \\\n$docbookFile\nxmlcatalog --noout --add \"public\" \\\n\"-//OASIS//DTD XML Exchange Table Model 19990315//EN\" \\\n\
+  \"file:///usr/share/xml/docbook/xml-dtd-4.5/soextblx.dtd\" \\\n$docbookFile\nxmlcatalog --noout --add \"public\" \\\n\"\
+  -//OASIS//ELEMENTS DocBook XML Information Pool V4.5//EN\" \\\n\"file:///usr/share/xml/docbook/xml-dtd-4.5/dbpoolx.mod\"\
+  \ \\\n$docbookFile\nxmlcatalog --noout --add \"public\" \\\n\"-//OASIS//ELEMENTS DocBook XML Document Hierarchy V4.5//EN\"\
+  \ \\\n\"file:///usr/share/xml/docbook/xml-dtd-4.5/dbhierx.mod\" \\\n$docbookFile\nxmlcatalog --noout --add \"public\" \\\
+  \n\"-//OASIS//ELEMENTS DocBook XML HTML Tables V4.5//EN\" \\\n\"file:///usr/share/xml/docbook/xml-dtd-4.5/htmltblx.mod\"\
+  \ \\\n$docbookFile\nxmlcatalog --noout --add \"public\" \\\n\"-//OASIS//ENTITIES DocBook XML Notations V4.5//EN\" \\\n\"\
+  file:///usr/share/xml/docbook/xml-dtd-4.5/dbnotnx.mod\" \\\n$docbookFile\nxmlcatalog --noout --add \"public\" \\\n\"-//OASIS//ENTITIES\
+  \ DocBook XML Character Entities V4.5//EN\" \\\n\"file:///usr/share/xml/docbook/xml-dtd-4.5/dbcentx.mod\" \\\n$docbookFile\n\
+  xmlcatalog --noout --add \"public\" \\\n\"-//OASIS//ENTITIES DocBook XML Additional General Entities V4.5//EN\" \\\n\"file:///usr/share/xml/docbook/xml-dtd-4.5/dbgenent.mod\"\
+  \ \\\n$docbookFile\nxmlcatalog --noout --add \"rewriteSystem\" \\\n\"http://www.oasis-open.org/docbook/xml/4.5\" \\\n\"\
+  file:///usr/share/xml/docbook/xml-dtd-4.5\" \\\n$docbookFile\nexport XML_CATALOG_FILES=$installdir/etc/xml/catalog\n\nxmlcatalog\
+  \ --noout --add \"rewriteURI\" \\\n\"http://www.oasis-open.org/docbook/xml/4.5\" \\\n\"file:///usr/share/xml/docbook/xml-dtd-4.5\"\
+  \ \\\n$xmlCatalogFile\n\nexport XML_CATALOG_FILES=$installdir/etc/xml/docbook\n\nfor DTDVERSION in 4.1.2 4.2 4.3 4.4 4.5\n\
+  do\n        xmlcatalog  --noout --add \"public\" \\\n        \"-//OASIS//DTD DocBook XML V$DTDVERSION//EN\" \\\n       \
+  \ \"http://www.oasis-open.org/docbook/xml/$DTDVERSION/docbookx.dtd\" \\\n        $docbookFile\n        xmlcatalog  --noout\
+  \ --add \"rewriteSystem\" \\\n        \"http://www.oasis-open.org/docbook/xml/$DTDVERSION\" \\\n        \"file:///usr/share/xml/docbook/xml-dtd-4.5\"\
+  \ \\\n        $docbookFile\n        xmlcatalog --noout --add \"rewriteURI\" \\\n        \"http://www.oasis-open.org/docbook/xml/$DTDVERSION\"\
+  \ \\\n        \"file:///usr/share/xml/docbook/xml-dtd-4.5\" \\\n        $docbookFile\n\n        export XML_CATALOG_FILES=$installdir/etc/xml/docbook\n\
+  \n        xmlcatalog --noout --add \"delegateSystem\" \\\n        \"http://www.oasis-open.org/docbook/xml/$DTDVERSION/\"\
+  \ \\\n        \"file:///etc/xml/docbook\" \\\n        $xmlCatalogFile\n\n        xmlcatalog --noout --add \"delegateURI\"\
+  \ \\\n        \"http://www.oasis-open.org/docbook/xml/$DTDVERSION/\" \\\n        \"file:///etc/xml/docbook\" \\\n      \
+  \  $xmlCatalogFile\ndone\n\nXML_CATALOG_FILES=$installdir/etc/xml/catalog\n\n# Now do docbook-xsl (nons) ..\nxmlcatalog\
+  \ --noout --add \"rewriteSystem\" \\\n   \"http://cdn.docbook.org/release/xsl-nons/${docbookVersion}\" \\\n   \"/usr/share/xml/docbook/xsl-stylesheets-${docbookVersion}\"\
+  \ \\\n$xmlCatalogFile\nxmlcatalog --noout --add \"rewriteURI\" \\\n   \"http://cdn.docbook.org/release/xsl-nons/${docbookVersion}\"\
+  \ \\\n   \"/usr/share/xml/docbook/xsl-stylesheets-${docbookVersion}\" \\\n$xmlCatalogFile\nxmlcatalog --noout --add \"rewriteSystem\"\
+  \ \\\n   \"http://cdn.docbook.org/release/xsl-nons/current\" \\\n   \"/usr/share/xml/docbook/xsl-stylesheets-${docbookVersion}\"\
+  \ \\\n$xmlCatalogFile\nxmlcatalog  --noout --add \"rewriteURI\" \\\n   \"http://cdn.docbook.org/release/xsl-nons/current\"\
+  \ \\\n   \"/usr/share/xml/docbook/xsl-stylesheets-${docbookVersion}\" \\\n$xmlCatalogFile\n\n# And do docbook-xsl (ns)...\n\
+  xmlcatalog --noout --add \"rewriteSystem\" \\\n   \"http://cdn.docbook.org/release/xsl/${docbookVersion}\" \\\n   \"/usr/share/xml/docbook/xsl-ns-stylesheets-${docbookVersion}\"\
+  \ \\\n$xmlCatalogFile\nxmlcatalog --noout --add \"rewriteURI\" \\\n   \"http://cdn.docbook.org/release/xsl/${docbookVersion}\"\
+  \ \\\n   \"/usr/share/xml/docbook/xsl-ns-stylesheets-${docbookVersion}\" \\\n$xmlCatalogFile\nxmlcatalog --noout --add \"\
+  rewriteSystem\" \\\n   \"http://cdn.docbook.org/release/xsl/current\" \\\n   \"/usr/share/xml/docbook/xsl-ns-stylesheets-${docbookVersion}\"\
+  \ \\\n$xmlCatalogFile\nxmlcatalog  --noout --add \"rewriteURI\" \\\n   \"http://cdn.docbook.org/release/xsl/current\" \\\
+  \n   \"/usr/share/xml/docbook/xsl-ns-stylesheets-${docbookVersion}\" \\\n$xmlCatalogFile\n\n\n# Keep the old sourceforge\
+  \ URIs for now\nxmlcatalog --noout --add \"rewriteSystem\" \\\n   \"http://docbook.sourceforge.net/release/xsl/current\"\
+  \ \\\n   \"/usr/share/xml/docbook/xsl-stylesheets-${docbookVersion}\" \\\n$xmlCatalogFile\nxmlcatalog --noout --add \"rewriteURI\"\
+  \ \\\n   \"http://docbook.sourceforge.net/release/xsl/current\" \\\n   \"/usr/share/xml/docbook/xsl-stylesheets-${docbookVersion}\"\
+  \ \\\n$xmlCatalogFile\nxmlcatalog --noout --add \"rewriteSystem\" \\\n   \"http://docbook.sourceforge.net/release/xsl-ns/current\"\
+  \ \\\n   \"/usr/share/xml/docbook/xsl-ns-stylesheets-${docbookVersion}\" \\\n$xmlCatalogFile\nxmlcatalog --noout --add \"\
+  rewriteURI\" \\\n   \"http://docbook.sourceforge.net/release/xsl-ns/current\" \\\n   \"/usr/share/xml/docbook/xsl-ns-stylesheets-${docbookVersion}\"\
+  \ \\\n$xmlCatalogFile\n\nXML_CATALOG_FILES=$installdir/etc/xml/catalog xmlcatalog --noout --add \"delegatePublic\" \"-//OASIS//DTD\
+  \ DocBook XML\" \"file:///etc/xml/docbook\" $xmlCatalogFile\n"
+patterns: []

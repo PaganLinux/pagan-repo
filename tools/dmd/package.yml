@@ -1,0 +1,71 @@
+name: dmd
+version: 2.105.2
+release: 20
+source:
+- git|https://github.com/dlang/dmd: v2.105.2
+- git|https://github.com/dlang/phobos: v2.105.2
+- git|https://github.com/dlang/tools: v2.105.2
+homepage: https://dlang.org/
+license: BSL-1.0
+summary: Digital Mars D (DMD) is the reference compiler and standard library for the D programming language
+description: 'D is a systems programming language with C-like syntax and static typing. It combines efficiency, control and
+  modeling power with safety and programmer productivity.
+
+  '
+component: programming
+category: tools
+builddeps:
+- dmd
+rundeps: []
+setup: 'cp -r $sources/dmd.git $workdir/dmd
+
+  cp -r $sources/dmd.git $workdir/stage1
+
+  # cp -r $sources/druntime.git $workdir/druntime
+
+  cp -r $sources/phobos.git $workdir/phobos
+
+  cp -r $sources/tools.git $workdir/tools
+
+  '
+build: '# Stage 1
+
+  cd $workdir/../stage1
+
+  %make -f posix.mak
+
+
+  # Stage 2
+
+  export BUILD=release
+
+  export ENABLE_RELEASE=1
+
+  cd $workdir
+
+  %make -f posix.mak DMD=$workdir/../stage1/generated/linux/release/64/dmd
+
+  # cd $workdir/../druntime
+
+  # %make -f posix.mak DMD=$workdir/generated/linux/release/64/dmd
+
+  cd $workdir/../phobos
+
+  %make -f posix.mak DMD=$workdir/generated/linux/release/64/dmd
+
+  cd $workdir/../tools
+
+  %make -f posix.mak DMD=$workdir/generated/linux/release/64/dmd
+
+  '
+install: "install -Dm00755 $workdir/generated/linux/release/64/dmd $installdir/usr/bin/dmd\ninstall -dm00644 $installdir/usr/include/dlang/dmd\n\
+  cp -r $workdir/../phobos/{*.d,etc,std} $installdir/usr/include/dlang/dmd\ncp -r druntime/import/* $installdir/usr/include/dlang/dmd\n\
+  install -Dm00744 $workdir/../phobos/generated/linux/release/64/libphobos2.a $installdir/usr/lib64/libphobos2.a\ninstall\
+  \ -Dm00755 $workdir/../phobos/generated/linux/release/64/libphobos2.so $installdir/usr/lib64/libphobos2.so\ninstall -Dm00755\
+  \ $workdir/../phobos/generated/linux/release/64/libphobos2.so.0.* $installdir/usr/lib64/\ninstall -Dm00644 $pkgfiles/dmd.conf\
+  \ $installdir/etc/dmd.conf\ninstall -dm00644 $installdir/usr/share/man/\ncp -r compiler/docs/man/* $installdir/usr/share/man/\n\
+  # tools\nfor p in catdoc changed checkwhitespace contributors ddemangle detab dget dustmite rdmd tolf updatecopyright; do\n\
+  \    install -Dm00755 $workdir/../tools/generated/linux/64/$p $installdir/usr/bin/$p\ndone\n"
+patterns:
+- /usr/include/*
+- /usr/lib64/*

@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║              PAGBUILD-SYNC – Synchronizacja plików buildowych               ║
+║                                                                              ║
+║  Sprawdza spójność plików .pagrecipe.yml między lokalnym katalogiem         ║
+║  a zapisanymi migawkami. Wykrywa:                                            ║
+║    • Nowe przepisy                                                           ║
+║    • Usunięte przepisy                                                       ║
+║    • Zmodyfikowane przepisy (zmiana wersji, źródeł, zależności)             ║
+║                                                                              ║
+║  UŻYCIE:                                                                     ║
+║    pagbuild-sync --check              # Tylko sprawdź (dry-run)             ║
+║    pagbuild-sync --apply              # Zastosuj zmiany + zapisz snapshot    ║
+║    pagbuild-sync --recipes /path      # Wskaż katalog z przepisami          ║
+║    pagbuild-sync --watch              # Tryb ciągłego monitorowania          ║
+║                                                                              ║
+║  CRON (co 10 minut):                                                         ║
+║    */10 * * * * pagbuild-sync --apply --auto-push                           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import sys
+import json
+import yaml
+import hashlib
+import argparse
+import subprocess
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+
+# ── Domyślne ścieżki ──
+DEFAULT_RECIPES_DIR = "/home/patryk/build/lfs-builder/packages/recipes"
+DEFAULT_SNAPSHOT_FILE = "/home/patryk/build/lfs-builder/pagan-web/data/recipe-snapshots.json"
+DEFAULT_GIT_REPO = "/home/patryk/build/lfs-builder"
+
+
+@dataclass
+class RecipeSnapshot:
+    relative_path: str
+    name: str
+    version: str
+    sha256: str = ""
+    dependencies_build: List[str] = field(default_factory=list)
+    dependencies_runtime: List[str] = field(default_factory=list)
+    sources: List[str] = field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════════
+# SKANOWANIE
+# ═══════════════════════════════════════════════════════════════
+
+def scan_recipes(recipes_dir: str) -> Dict[str, RecipeSnapshot]:
+    """Skanuje katalog recipes i zwraca słownik migawek."""
+    recipes_path = Path(recipes_dir)
+    if not recipes_path.exists():
+        print(f"❌ Katalog nie istnieje: {recipes_dir}")
+        sys.exit(1)
+
+    snapshots = {}
+    for yml_file in recipes_path.rglob("*.yml"):
+        try:
+            snapshot = _parse_recipe(yml_file, recipes_path)
+            if snapshot:
+                snapshots[snapshot.relative_path] = snapshot
+        except Exception as e:
+            print(f"⚠ Błąd parsowania {yml_file}: {e}")
+
+    return snapshots
+
+
+def _parse_recipe(path: Path, base_dir: Path) -> Optional[RecipeSnapshot]:
+    """Parsuje pojedynczy plik .pagrecipe.yml."""
+    with open(path, "r") as f:
+        content = f.read()
+
+    data = yaml.safe_load(content)
+    if not data or "name" not in data:
+        return None
+
+    file_hash = hashlib.sha256(content.encode()).hexdigest()
+
+    try:
+        rel_path = str(path.relative_to(base_dir))
+    except ValueError:
+        rel_path = path.name
+
+    deps = data.get("dependencies", {})
+    if not isinstance(deps, dict):
+        deps = {}
+
+    return RecipeSnapshot(
+        relative_path=rel_path,
+        name=data.get("name", ""),
+        version=str(data.get("version", "")),
+        sha256=file_hash,
+        dependencies_build=deps.get("build", []),
+        dependencies_runtime=deps.get("runtime", []),
+        sources=data.get("sources", []) if isinstance(data.get("sources"), list) else [],
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# MIGAWKI REFERENCYJNE
+# ═══════════════════════════════════════════════════════════════
+
+def load_snapshots(path: str) -> Dict[str, RecipeSnapshot]:
+    """Wczytuje migawki z pliku JSON."""
+    if not os.path.isfile(path):
+        return {}
+
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    snapshots = {}
+    for item in data.get("snapshots", []):
+        s = RecipeSnapshot(
+            relative_path=item.get("relative_path", ""),
+            name=item.get("name", ""),
+            version=item.get("version", ""),
+            sha256=item.get("sha256", ""),
+            dependencies_build=item.get("dependencies_build", []),
+            dependencies_runtime=item.get("dependencies_runtime", []),
+            sources=item.get("sources", []),
+        )
+        snapshots[s.relative_path] = s
+
+    return snapshots
+
+
+def save_snapshots(snapshots: Dict[str, RecipeSnapshot], path: str):
+    """Zapisuje migawki do pliku JSON."""
+    data = {
+        "generated_at": datetime.now(datetime.UTC).isoformat(),
+        "generator": "pagbuild-sync v1.0",
+        "total_recipes": len(snapshots),
+        "snapshots": [
+            {
+                "relative_path": s.relative_path,
+                "name": s.name,
+                "version": s.version,
+                "sha256": s.sha256,
+                "dependencies_build": s.dependencies_build,
+                "dependencies_runtime": s.dependencies_runtime,
+                "sources": s.sources,
+            }
+            for s in snapshots.values()
+        ],
+    }
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════
+# PORÓWNYWANIE
+# ═══════════════════════════════════════════════════════════════
+
+def compare(
+    local: Dict[str, RecipeSnapshot],
+    reference: Dict[str, RecipeSnapshot],
+    verbose: bool = False,
+) -> dict:
+    """Porównuje migawki lokalne z referencyjnymi."""
+    all_paths = set(local.keys()) | set(reference.keys())
+    result = {
+        "total": 0,
+        "up_to_date": 0,
+        "new": [],
+        "removed": [],
+        "version_changed": [],
+        "modified": [],
+        "is_clean": False,
+    }
+
+    for path in sorted(all_paths):
+        local_snap = local.get(path)
+        ref_snap = reference.get(path)
+
+        if local_snap and not ref_snap:
+            result["new"].append({
+                "path": path,
+                "name": local_snap.name,
+                "version": local_snap.version,
+            })
+            if verbose:
+                print(f"  🆕 NOWY: {local_snap.name} v{local_snap.version} ({path})")
+
+        elif ref_snap and not local_snap:
+            result["removed"].append({
+                "path": path,
+                "name": ref_snap.name,
+                "version": ref_snap.version,
+            })
+            if verbose:
+                print(f"  🗑 USUNIĘTY: {ref_snap.name} ({path})")
+
+        elif local_snap and ref_snap:
+            if local_snap.sha256 != ref_snap.sha256:
+                if local_snap.version != ref_snap.version:
+                    result["version_changed"].append({
+                        "path": path,
+                        "name": local_snap.name,
+                        "old_version": ref_snap.version,
+                        "new_version": local_snap.version,
+                    })
+                    if verbose:
+                        print(f"  📈 WERSJA: {local_snap.name}: {ref_snap.version} → {local_snap.version}")
+                else:
+                    result["modified"].append({
+                        "path": path,
+                        "name": local_snap.name,
+                        "version": local_snap.version,
+                    })
+                    if verbose:
+                        print(f"  ✏️ MODYFIKACJA: {local_snap.name} v{local_snap.version} ({path})")
+            else:
+                result["up_to_date"] += 1
+
+    result["total"] = len(all_paths)
+    result["is_clean"] = (
+        len(result["new"]) == 0
+        and len(result["removed"]) == 0
+        and len(result["version_changed"]) == 0
+        and len(result["modified"]) == 0
+    )
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# GIT INTEGRATION
+# ═══════════════════════════════════════════════════════════════
+
+def git_commit_and_push(repo_path: str, message: str) -> bool:
+    """Commit + push snapshot file."""
+    snapshot_file = os.path.join(
+        os.path.dirname(DEFAULT_SNAPSHOT_FILE),
+        "recipe-snapshots.json"
+    )
+
+    try:
+        subprocess.run(
+            ["git", "-C", repo_path, "add", snapshot_file],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        r = subprocess.run(
+            ["git", "-C", repo_path, "commit", "-m", message],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        # "nothing to commit" is OK
+        r2 = subprocess.run(
+            ["git", "-C", repo_path, "push"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        return r2.returncode == 0
+    except Exception as e:
+        print(f"  ⚠ Git error: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# MONITOROWANIE
+# ═══════════════════════════════════════════════════════════════
+
+def watch_mode(recipes_dir: str, snapshot_file: str, interval: int, auto_push: bool, repo_path: str):
+    """Tryb ciągłego monitorowania (jak watchdog)."""
+    print(f"👁 Tryb monitorowania (co {interval}s). Ctrl+C aby zatrzymać.\n")
+    try:
+        while True:
+            local = scan_recipes(recipes_dir)
+            reference = load_snapshots(snapshot_file)
+            result = compare(local, reference, verbose=False)
+
+            if not result["is_clean"]:
+                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔄 Wykryto zmiany:")
+                print(f"  Nowe: {len(result['new'])}, "
+                      f"Usunięte: {len(result['removed'])}, "
+                      f"Zmiana wersji: {len(result['version_changed'])}, "
+                      f"Modyfikacje: {len(result['modified'])}")
+
+                if auto_push:
+                    save_snapshots(local, snapshot_file)
+                    msg = (
+                        f"pagbuild-sync: {len(result['new'])} new, "
+                        f"{len(result['version_changed'])} version bumps"
+                    )
+                    git_commit_and_push(repo_path, msg)
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n👋 Zatrzymano monitorowanie.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="pagbuild-sync – Synchronizacja plików buildowych .pagrecipe.yml",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Przykłady:
+  pagbuild-sync --check                    # Sprawdź stan
+  pagbuild-sync --apply                    # Zastosuj zmiany
+  pagbuild-sync --apply --auto-push        # Zastosuj + commit + push
+  pagbuild-sync --watch --interval 60      # Monitoruj co 60s
+        """
+    )
+
+    parser.add_argument("--check", action="store_true",
+                        help="Tylko sprawdź zmiany (dry-run)")
+    parser.add_argument("--apply", action="store_true",
+                        help="Zastosuj zmiany i zapisz snapshot")
+    parser.add_argument("--recipes", default=DEFAULT_RECIPES_DIR,
+                        help=f"Katalog z przepisami (domyślnie: {DEFAULT_RECIPES_DIR})")
+    parser.add_argument("--snapshot-file", default=DEFAULT_SNAPSHOT_FILE,
+                        help="Plik migawek JSON")
+    parser.add_argument("--auto-push", action="store_true",
+                        help="Automatycznie commit + push snapshot do Git")
+    parser.add_argument("--git-repo", default=DEFAULT_GIT_REPO,
+                        help="Ścieżka do repozytorium Git")
+    parser.add_argument("--watch", action="store_true",
+                        help="Tryb ciągłego monitorowania")
+    parser.add_argument("--interval", type=int, default=30,
+                        help="Interwał monitorowania w sekundach (domyślnie: 30)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Szczegółowe logowanie")
+    parser.add_argument("--json", action="store_true",
+                        help="Wyjście w formacie JSON")
+
+    args = parser.parse_args()
+
+    # Domyślna akcja
+    if not args.check and not args.apply and not args.watch:
+        args.check = True
+
+    # ── Tryb watch ──
+    if args.watch:
+        watch_mode(args.recipes, args.snapshot_file, args.interval, args.auto_push, args.git_repo)
+        return
+
+    # ── Skanuj + porównaj ──
+    print(f"🔍 Skanowanie przepisów w: {args.recipes}")
+    local = scan_recipes(args.recipes)
+    print(f"   Znaleziono {len(local)} przepisów")
+
+    reference = load_snapshots(args.snapshot_file)
+    if reference:
+        print(f"   Wczytano {len(reference)} migawek referencyjnych")
+    else:
+        print(f"   Brak pliku migawek – to pierwsze uruchomienie")
+
+    result = compare(local, reference, verbose=args.verbose)
+
+    # ── Wyjście ──
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"\n{'='*60}")
+        print(f"📊 Wynik synchronizacji:")
+        print(f"   Łącznie przepisów: {result['total']}")
+        print(f"   Aktualnych:        {result['up_to_date']}")
+        print(f"   Nowych:            {len(result['new'])}")
+        print(f"   Usuniętych:        {len(result['removed'])}")
+        print(f"   Zmiana wersji:     {len(result['version_changed'])}")
+        print(f"   Zmodyfikowanych:   {len(result['modified'])}")
+
+        if result["is_clean"]:
+            print(f"\n✅ Wszystkie pliki build są aktualne.")
+        else:
+            print(f"\n⚠ Wykryto zmiany. Użyj --apply aby zastosować.")
+
+        # Lista zmian wersji
+        for vc in result["version_changed"]:
+            print(f"   📈 {vc['name']}: {vc['old_version']} → {vc['new_version']}")
+        for n in result["new"]:
+            print(f"   🆕 NOWY: {n['name']} v{n['version']}")
+
+    # ── Apply ──
+    if args.apply:
+        print(f"\n💾 Zapisuję snapshot...")
+        save_snapshots(local, args.snapshot_file)
+        print(f"   ✅ Zapisano {len(local)} migawek do {args.snapshot_file}")
+
+        if args.auto_push:
+            print(f"\n📤 Commit + push do Git...")
+            changes = len(result["new"]) + len(result["version_changed"]) + len(result["modified"])
+            msg = f"pagbuild-sync: {changes} recipe changes"
+            if git_commit_and_push(args.git_repo, msg):
+                print(f"   ✅ Wypchnięto do repozytorium")
+            else:
+                print(f"   ⚠ Push mógł się nie udać (sprawdź uprawnienia)")
+
+    sys.exit(0 if result["is_clean"] else 1)
+
+
+if __name__ == "__main__":
+    main()

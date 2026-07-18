@@ -1,0 +1,52 @@
+name: dbus
+version: 1.16.2
+release: 40
+source:
+- https://dbus.freedesktop.org/releases/dbus/dbus-1.16.2.tar.xz: 0ba2a1a4b16afe7bceb2c07e9ce99a8c2c3508e5dec290dbb643384bd6beb7e2
+homepage: https://www.freedesktop.org/wiki/Software/dbus/
+license:
+- GPL-2.0-or-later
+- LGPL-2.1-or-later
+summary:
+- System Message Daemon
+- launch: X11 dbus-launch helper
+description: 'D-Bus is a message bus system, a simple way for applications to talk to oneg another. D-Bus supplies both a
+  system daemon (for events such as "new hardware device added" or "printer queue changed") and a per-user login-session daemon
+  (for general IPC needs among user applications). Also, the message bus is built on top of a general one-to-one message passing
+  framework, which can be used by any two applications to communicate directly (without going through the message bus daemon).
+
+  '
+component: system.base
+category: core
+builddeps:
+- pkgconfig32(expat)
+- pkgconfig32(glib-2.0)
+- pkgconfig32(gudev-1.0)
+- pkgconfig32(libgcrypt)
+- pkgconfig32(liblzma)
+- pkgconfig32(libudev)
+- pkgconfig32(libzstd)
+- pkgconfig32(x11)
+- docbook-xml
+- xmlto
+rundeps: []
+setup: "%meson_configure \\\n                 --libexecdir=%libdir%/dbus-1.0 \\\n                 -Dsystemd_system_unitdir=/usr/lib64/systemd/system\
+  \ \\\n                 -Dsystemd_user_unitdir=/usr/lib64/systemd/user \\\n"
+build: '%ninja_build
+
+  '
+install: "%ninja_install\n# Per dbus documentation, behavior is now determined by /usr/share/dbus-1/* and /etc contents can\
+  \ be safely deleted.\n# /var was already previously being deleted since it shouldn't be shipped.\nrm -rfv $installdir/{etc,run,var}\n\
+  if [[ ! -z \"${EMUL32BUILD}\" ]]; then\n    rm -v $installdir/%libdir%/dbus-1.0/dbus-daemon-launch-helper\nelse\n    chmod\
+  \ o+x $installdir/%libdir%/dbus-1.0/dbus-daemon-launch-helper\nfi\n\nif [[ -z \"${EMUL32BUILD}\" ]]; then\n    # Remove\
+  \ dbus.service in favor of dbus-broker\n    rm -v $installdir/%libdir%/systemd/system/dbus.service\n    rm -v $installdir/%libdir%/systemd/system/multi-user.target.wants/dbus.service\n\
+  \    rmdir $installdir/%libdir%/systemd/system/multi-user.target.wants/\n\n    # And for user services\n    rm -v $installdir/%libdir%/systemd/user/dbus.service\n\
+  fi\n"
+patterns:
+- devel: /usr/lib64/dbus-1.0/include/
+- 32bit-devel: /usr/lib32/dbus-1.0/include/
+- docs:
+  - /usr/share/doc
+- launch:
+  - /usr/bin/dbus-launch
+  - /usr/share/man/man1/dbus-launch.1

@@ -1,0 +1,77 @@
+name: dolphin-emu
+version: '2512'
+release: 90
+source:
+- git|https://github.com/dolphin-emu/dolphin.git: 2512
+homepage: https://dolphin-emu.org/
+license:
+- BSD-3-Clause
+- CC0-1.0
+- GPL-2.0-or-later
+- MIT
+summary: GameCube / Wii emulator
+description: 'GameCube / Wii emulator, allowing you to play games for these two platforms on your PC.
+
+  '
+component: games.emulator
+category: other
+builddeps:
+- pkgconfig(Qt6Svg)
+- pkgconfig(alsa)
+- pkgconfig(bluez)
+- pkgconfig(fmt)
+- pkgconfig(gtest)
+- pkgconfig(gtk+-2.0)
+- pkgconfig(hidapi-libusb)
+- pkgconfig(libavcodec)
+- pkgconfig(libcubeb)
+- pkgconfig(libcurl)
+- pkgconfig(libenet)
+- pkgconfig(libevdev)
+- pkgconfig(liblz4)
+- pkgconfig(libpulse)
+- pkgconfig(libusb-1.0)
+- pkgconfig(libxxhash)
+- pkgconfig(libzstd)
+- pkgconfig(lzo2)
+- pkgconfig(mbedtls)
+- pkgconfig(miniupnpc)
+- pkgconfig(minizip-ng)
+- pkgconfig(openal)
+- pkgconfig(portaudio-2.0)
+- pkgconfig(pugixml)
+- pkgconfig(sdl3)
+- pkgconfig(sfml-all)
+- pkgconfig(soundtouch)
+- pkgconfig(speexdsp)
+- pkgconfig(spng)
+- pkgconfig(xi)
+- pkgconfig(xrandr)
+- llvm-devel
+- qt6-base-private-devel
+rundeps: []
+setup: "%patch -p1 -i $pkgfiles/0001-Desktop-integration-fixes.patch\n%patch -p1 -i $pkgfiles/0001-solus-Suppress-dirty-from-version-string.patch\n\
+  \n# Use system zlib (upstream doesn't like this for performance reasons):\nsed -i 's/add_subdirectory(\\(.*zlib\\)/dolphin_find_optional_system_library_pkgconfig(ZLIB\
+  \ zlib-ng ZLIB::ZLIB \\1/' CMakeLists.txt\nsed -i 's/ZLIB::ZLIB/ZLIB::ZLIB z/' Source/Core/*/CMakeLists.txt\n\n%cmake_ninja\
+  \ -DDISTRIBUTOR='Solus' \\\n             -DENABLE_AUTOUPDATE=OFF \\\n             -DENABLE_TESTS=OFF \\\n"
+build: '%ninja_build
+
+  '
+install: '%ninja_install
+
+  %install_license COPYING
+
+  %install_license LICENSES/*
+
+
+  # Install udev rule
+
+  install -Dm00644 Data/51-usb-device.rules $installdir/%libdir%/udev/rules.d/51-usb-device.rules
+
+
+  # Appdata
+
+  install -Dm00644 $pkgfiles/org.DolphinEmu.dolphin-emu.appdata.xml $installdir/usr/share/metainfo/org.DolphinEmu.dolphin-emu.appdata.xml
+
+  '
+patterns: []

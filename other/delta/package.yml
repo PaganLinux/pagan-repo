@@ -1,0 +1,37 @@
+name: delta
+version: 0.19.2
+release: 4
+source:
+- https://github.com/dandavison/delta/archive/refs/tags/0.19.2.tar.gz: f59b86f8c8dda4d76a3ba34b8553777a20c3b461646917d8e480fac6531bba9f
+homepage: https://dandavison.github.io/delta/
+license: MIT
+summary: A syntax-highlighting pager for git, diff, and grep output
+description: 'A syntax-highlighting pager for git, diff, and grep output
+
+  '
+component: programming.tools
+category: other
+builddeps:
+- pkgconfig(oniguruma)
+- rust
+rundeps: []
+setup: '%cargo_fetch
+
+  '
+build: "export RUSTONIG_DYNAMIC_LIBONIG=1\n%cargo_build --all-features\n\nfor shell in bash fish zsh; do\n    target/release/delta\
+  \ --generate-completion=\"$shell\" > \"${shell}-completion\"\ndone\n"
+install: '%cargo_install
+
+  %install_license LICENSE
+
+
+  # Completions
+
+  install -Dm00644 bash-completion ${installdir}/usr/share/bash-completion/completions/delta
+
+  install -Dm00644 fish-completion ${installdir}/usr/share/fish/vendor_completions.d/delta.fish
+
+  install -Dm00644 zsh-completion ${installdir}/usr/share/zsh/site-functions/_delta
+
+  '
+patterns: []

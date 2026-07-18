@@ -1,0 +1,55 @@
+name: dragon
+version: 26.04.3
+release: 28
+source:
+- https://download.kde.org/stable/release-service/26.04.3/src/dragon-26.04.3.tar.xz: 263fff59c7ef58cfe887bfae7c953ae223fce14be4f8556565b43adc7026799e
+homepage: https://apps.kde.org/dragonplayer/
+license:
+- CC0-1.0
+- GPL-2.0-only
+- GPL-2.0-or-later
+- GPL-3.0-only
+- LGPL-3.0-or-later
+summary: Video player from KDE
+description: 'Dragon Player is a multimedia player where the focus is on simplicity, instead of features
+
+  '
+component: multimedia.video
+category: other
+builddeps:
+- pkgconfig(KF6WindowSystem)
+- pkgconfig(Qt6Multimedia)
+- pkgconfig(libavcodec)
+- kf6-kconfig-devel
+- kf6-kconfigwidgets-devel
+- kf6-kcoreaddons-devel
+- kf6-kcrash-devel
+- kf6-kdbusaddons-devel
+- kf6-kdoctools-devel
+- kf6-ki18n-devel
+- kf6-kio-devel
+- kf6-kirigami-devel
+- kf6-kjobwidgets-devel
+- kf6-kparts-devel
+- kf6-kwidgetsaddons-devel
+- kf6-kxmlgui-devel
+- kf6-solid-devel
+- qt6-base-private-devel
+rundeps: []
+setup: '%cmake_kf6
+
+  '
+build: '%ninja_build
+
+  '
+install: '%ninja_install
+
+  %install_license LICENSES/*
+
+
+  # remove doc
+
+  rm -rfv $installdir/usr/share/doc
+
+  '
+patterns: []

@@ -1,0 +1,34 @@
+name: dbus-glib
+version: '0.114'
+release: 18
+source:
+- https://dbus.freedesktop.org/releases/dbus-glib/dbus-glib-0.114.tar.gz: c09c5c085b2a0e391b8ee7d783a1d63fe444e96717cc1814d61b5e8fc2827a7c
+homepage: https://www.freedesktop.org/wiki/Software/dbus/
+license: LGPL-2.0-or-later
+summary: D-Bus GLib Bindings
+description: 'The D-Bus Bindings are a group of packages that contain programming language and platform interfaces to the
+  D-Bus API. This is useful for programmers to easily interface D-Bus with their supported platform or language of choice.
+  Some non-D-Bus packages will require one or more of the Bindings packages in order to build successfully.
+
+  '
+component: programming.library
+category: other
+builddeps:
+- pkgconfig32(dbus-1)
+- pkgconfig32(expat)
+- pkgconfig32(gio-2.0)
+- pkgconfig32(libgcrypt)
+- pkgconfig32(liblzma)
+- pkgconfig32(libsystemd)
+- gtk-doc
+rundeps: []
+setup: "%patch -p1 -i $pkgfiles/0001-Tweak-bash-completion-install-path.patch\n%reconfigure --libexecdir=%libdir%/dbus-1.0\
+  \ \\\n           --with-console-auth-dir=/run/console/ \\\n           --with-systemdsystemunitdir=%libdir%/systemd/system\
+  \ \\\n           --disable-static\n"
+build: '%make
+
+  '
+install: '%make_install
+
+  '
+patterns: []

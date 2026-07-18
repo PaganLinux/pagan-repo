@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    PAGSYNC – Pagan Linux Package Syncer                     ║
+║   Buduje wszystkie pakiety z przepisów, generuje repo.json, podpisuje GPG,  ║
+║   synchronizuje na serwer przez rsync/ssh                                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+UŻYCIE:
+  pagsync build [kategoria]        Buduje pakiety (np. core, desktop, gaming)
+  pagsync rebuild [nazwa]          Przebudowuje konkretny pakiet
+  pagsync repo                     Generuje repo.json + podpisuje GPG
+  pagsync sync [target]            Synchronizuje na serwer (rsync)
+  pagsync all [target]             build + repo + sync w jednym
+"""
+
+import os, sys, json, yaml, shutil, hashlib, subprocess, argparse, glob
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RECIPES_DIR = os.path.join(BASE_DIR, "recipes")
+BUILD_DIR = os.path.join(BASE_DIR, "build-output")
+REPO_DIR = os.environ.get("PAGAN_REPO_DIR", "/var/www/repo.paganlinux.eu")
+SIGN_KEY = os.environ.get("PAGBUILD_GPG_KEY", "")
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""): h.update(chunk)
+    return h.hexdigest()
+
+def _find_recipes(category: str = "") -> List[Path]:
+    """Znajduje wszystkie pagbuild.yml w katalogu recipes."""
+    if category:
+        pattern = os.path.join(RECIPES_DIR, category, "**", "pagbuild.yml")
+    else:
+        pattern = os.path.join(RECIPES_DIR, "**", "pagbuild.yml")
+    return sorted(Path(p) for p in glob.glob(pattern, recursive=True))
+
+def _load_recipe(path: Path) -> dict:
+    with open(path) as f:
+        r = yaml.safe_load(f)
+    if not r:
+        print(f"  ⚠ Pusty przepis: {path}")
+        return {}
+    return r
+
+def cmd_build(category: str = ""):
+    """Buduje pakiety z przepisów."""
+    recipes = _find_recipes(category)
+    if not recipes:
+        print(f"❌ Brak przepisów{' w kategorii '+category if category else ''} w {RECIPES_DIR}")
+        return 1
+
+    os.makedirs(BUILD_DIR, exist_ok=True)
+    print(f"🔨 Budowanie {len(recipes)} pakietów...")
+
+    failed = []
+    for rp in recipes:
+        recipe = _load_recipe(rp)
+        name = recipe.get("name", rp.parent.name)
+        version = recipe.get("version", "0")
+        print(f"\n{'─'*50}")
+        print(f"📦 {name}-{version}  ({rp.parent})")
+        print(f"{'─'*50}")
+
+        # Sprawdź czy wersja nie jest już zbudowana
+        existing = os.path.join(BUILD_DIR, f"{name}-{version}.pkg.tar.xz")
+        if os.path.exists(existing):
+            print(f"  ✓ Już zbudowany: {existing}")
+            continue
+
+        # Buduj przez pagbuild
+        try:
+            env = os.environ.copy()
+            pp = env.get('PYTHONPATH', '')
+            env['PYTHONPATH'] = BASE_DIR + (':' + pp if pp else '')
+            result = subprocess.run(
+                [sys.executable, "-m", "pagbuild", str(rp),
+                 "--repo-url", REPO_DIR,
+                 "--output-dir", BUILD_DIR],
+                capture_output=True, text=True, timeout=3600, env=env,
+            )
+            if result.returncode == 0:
+                print(f"  ✅ {name}-{version} zbudowany")
+                if result.stdout:
+                    for line in result.stdout.split("\n")[-3:]:
+                        if line.strip(): print(f"  {line.strip()}")
+            else:
+                print(f"  ❌ Błąd: {result.stderr[-200:]}")
+                failed.append(name)
+        except Exception as e:
+            print(f"  ❌ Wyjątek: {e}")
+            failed.append(name)
+
+    if failed:
+        print(f"\n❌ Niepowodzenia ({len(failed)}): {', '.join(failed)}")
+        return 1
+    print(f"\n✅ Zbudowano {len(recipes)} pakietów!")
+    return 0
+
+def cmd_rebuild(package_name: str):
+    """Przebudowuje konkretny pakiet."""
+    recipes = _find_recipes()
+    found = None
+    for rp in recipes:
+        recipe = _load_recipe(rp)
+        if recipe.get("name") == package_name or rp.parent.name == package_name:
+            found = rp
+            break
+
+    if not found:
+        print(f"❌ Nie znaleziono przepisu dla: {package_name}")
+        return 1
+
+    # Usuń stary build
+    recipe = _load_recipe(found)
+    name = recipe.get("name", found.parent.name)
+    version = recipe.get("version", "0")
+    old = os.path.join(BUILD_DIR, f"{name}-{version}.pkg.tar.xz")
+    if os.path.exists(old):
+        os.remove(old)
+        print(f"  🗑 Usunięto stary build: {old}")
+
+    return cmd_build(found.parent.parent.name)
+
+def cmd_repo():
+    """Generuje repo.json z zbudowanych pakietów."""
+    pkgs = []
+    for f in sorted(os.listdir(BUILD_DIR)):
+        fp = os.path.join(BUILD_DIR, f)
+        if os.path.isfile(fp) and f.endswith(".pkg.tar.xz"):
+            sha = _sha256(fp)
+            size = os.path.getsize(fp)
+            parts = f.rsplit(".pkg", 1)[0].rsplit("-", 1)
+            has_sig = os.path.exists(fp + ".sig")
+            pkgs.append({
+                "filename": f,
+                "name": parts[0] if len(parts) > 1 else f,
+                "version": parts[1] if len(parts) > 1 else "0",
+                "size": size,
+                "size_mb": round(size/1048576, 2),
+                "sha256": sha,
+                "signed": has_sig,
+                "build_date": datetime.now().strftime("%Y-%m-%d"),
+            })
+
+    if not pkgs:
+        print("❌ Brak zbudowanych pakietów. Uruchom najpierw: pagsync build")
+        return 1
+
+    # Zapisz repo.json lokalnie
+    os.makedirs(BUILD_DIR, exist_ok=True)
+    repo_data = {
+        "name": "Pagan Linux Repository",
+        "version": "1.0",
+        "arch": "x86_64",
+        "packages": pkgs,
+        "updated": datetime.now().isoformat(),
+    }
+    repo_path = os.path.join(BUILD_DIR, "repo.json")
+    with open(repo_path, "w") as f:
+        json.dump(repo_data, f, indent=2)
+    print(f"📋 repo.json: {len(pkgs)} pakietów ({sum(p['size_mb'] for p in pkgs):.1f} MB)")
+
+    # Podpisz GPG jeśli klucz skonfigurowany
+    if SIGN_KEY:
+        sig_path = repo_path + ".sig"
+        r = subprocess.run(
+            ["gpg", "--detach-sign", "--armor", "--local-user", SIGN_KEY,
+             "--output", sig_path, repo_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            print(f"  🔐 repo.json podpisany → {sig_path}")
+        else:
+            print(f"  ⚠ Błąd podpisu: {r.stderr[:100]}")
+    else:
+        print(f"  ⚡ Brak SIGN_KEY – pakiet niepodpisany")
+
+    # Wygeneruj index.html
+    _generate_index(pkgs)
+    return 0
+
+def _generate_index(pkgs: list):
+    html = """<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>Pagan Linux – Repozytorium</title>
+    <style>body{font-family:monospace;background:#0d1117;color:#e6edf3;padding:20px;max-width:900px;margin:0 auto}
+    h1{color:#58a6ff}table{width:100%;border-collapse:collapse;margin-top:16px}
+    th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #30363d}
+    th{background:#161b22}tr:hover{background:#21262d}
+    code{color:#3fb950}.sig{color:#d2991d}.dim{color:#8b949e;font-size:0.85em}
+    </style></head><body>
+    <h1>📦 Pagan Linux Repository</h1>
+    <p class="dim">"""
+    html += f"{len(pkgs)} packages · Python package manager: <code>pag install &lt;nazwa&gt;</code></p>"
+    html += '<table><tr><th>Package</th><th>Version</th><th>Size</th><th>Sig</th></tr>'
+
+    for p in sorted(pkgs, key=lambda x: x["name"]):
+        sig = "🔐" if p.get("signed") else " "
+        html += f'<tr><td><code>{p["name"]}</code></td><td>{p["version"]}</td><td class="dim">{p["size_mb"]} MB</td><td class="sig">{sig}</td></tr>'
+
+    html += '</table><p class="dim" style="margin-top:20px;">Generated by pagsync</p></body></html>'
+
+    with open(os.path.join(BUILD_DIR, "index.html"), "w") as f:
+        f.write(html)
+    print(f"  📄 index.html wygenerowany")
+
+def cmd_sync(target: str = ""):
+    """Synchronizuje build-output z repozytorium na serwerze."""
+    if not target:
+        target = os.environ.get("PAGAN_SYNC_TARGET", "")
+
+    if not target:
+        print("❌ Brak targetu. Ustaw PAGAN_SYNC_TARGET lub podaj argument.")
+        print("   Przykład: pagsync sync root@vps:/var/www/repo.paganlinux.eu")
+        return 1
+
+    print(f"🚀 Synchronizacja z {target}...")
+
+    # rsync
+    result = subprocess.run(
+        ["rsync", "-avz", "--delete", "--progress",
+         BUILD_DIR + "/", f"{target}/"],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode == 0:
+        lines = [l for l in result.stdout.split("\n") if l.strip() and not l.startswith(".") and "bytes/sec" not in l]
+        print(f"  ✅ Wysłano: {len(lines[1:-1]) if len(lines)>2 else '?'} plików")
+        print(f"  📊 {[l for l in lines if 'bytes' in l][:1]}")
+    else:
+        print(f"  ❌ Błąd rsync: {result.stderr[:200]}")
+        return 1
+    return 0
+
+def cmd_all(target: str = ""):
+    """build + repo + sync"""
+    if cmd_build() != 0:
+        return 1
+    if cmd_repo() != 0:
+        return 1
+    if target or os.environ.get("PAGAN_SYNC_TARGET"):
+        if cmd_sync(target) != 0:
+            return 1
+    else:
+        print("   ⚡ Pomijam sync (brak targetu). Ustaw PAGAN_SYNC_TARGET lub podaj argument.")
+    return 0
+
+def main():
+    parser = argparse.ArgumentParser(description="pagsync – Pagan Linux Package Syncer")
+    parser.add_argument("action", choices=["build", "rebuild", "repo", "sync", "all"],
+                        help="build=buduj, rebuild=przebuduj, repo=generuj indeks, sync=wyślij na serwer, all=wszystko")
+    parser.add_argument("arg", nargs="?", default="", help="Kategoria (build) / nazwa pakietu (rebuild) / target (sync/all)")
+
+    args = parser.parse_args()
+
+    actions = {
+        "build": lambda: cmd_build(args.arg),
+        "rebuild": lambda: cmd_rebuild(args.arg),
+        "repo": cmd_repo,
+        "sync": lambda: cmd_sync(args.arg),
+        "all": lambda: cmd_all(args.arg),
+    }
+
+    sys.exit(actions[args.action]() or 0)
+
+if __name__ == "__main__":
+    main()

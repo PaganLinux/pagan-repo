@@ -1,0 +1,37 @@
+name: dtc
+version: 1.7.0
+release: 1
+source:
+- https://mirrors.edge.kernel.org/pub/software/utils/dtc/dtc-1.7.0.tar.gz: 44844eb5373f8780ca1b7b4f64c073b349da1746aaad76c531f65a9dd2483232
+homepage: https://www.devicetree.org/
+license: GPL-2.0-or-later
+summary: Device Tree Compiler
+description: 'Device Tree Compiler
+
+  '
+component: system.utils
+category: other
+builddeps:
+- pkgconfig(yaml-0.1)
+rundeps: []
+setup: '# Fix version string
+
+  sed -i "s|1.6.0|1.7.0|" meson.build libfdt/meson.build
+
+  cat meson.build
+
+
+  %meson_configure -Dstatic-build=false
+
+  '
+build: '%ninja_build
+
+  '
+install: '%ninja_install
+
+  rm -v $installdir/usr/lib64/*.a
+
+  '
+patterns:
+- ^libfdt:
+  - /usr/lib64/libfdt.so.1*

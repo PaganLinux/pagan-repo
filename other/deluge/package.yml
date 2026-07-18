@@ -1,0 +1,59 @@
+name: deluge
+version: 2.2.0
+release: 32
+source:
+- https://ftp.osuosl.org/pub/deluge/source/2.2/deluge-2.2.0.tar.xz: b9ba272b5ba42aaf1c694e6c29628ab816cc1a700a37bac08aacb52571606acd
+homepage: https://deluge-torrent.org/
+license: GPL-3.0-or-later
+summary: A full-featured BitTorrent client
+description: 'Deluge is a full-featured BitTorrent client written in Python and GTK.
+
+  '
+component: network.download
+category: other
+builddeps:
+- python-build
+- python-installer
+- python-setuptools
+- python-wheel
+rundeps:
+- libayatana-appindicator
+- librsvg
+- libtorrent-rasterbar
+- python-chardet
+- python-distro
+- python-gobject
+- python-openssl
+- python-pillow
+- python-rencode
+- python-setproctitle
+- python-twisted
+- python-zope.interface
+- python3-dbus
+- pyxdg
+- xdg-utils
+setup: 'patch -p1 -i $pkgfiles/no-pkg_resources.patch
+
+  # Mako is a dep of the Web UI. We don''t need it
+
+  sed "/''mako''/d" -i setup.py
+
+
+  # Missing files when built with PEP517
+
+  rm setup.cfg pyproject.toml
+
+  '
+build: '%python3_setup
+
+  '
+install: '%python3_install
+
+  rm $installdir/usr/bin/{deluge-web,deluged}
+
+  rm $installdir/usr/share/man/man1/{deluge-web,deluged}.1
+
+  rm -rf $installdir/usr/lib/python*/site-packages/deluge/ui/web
+
+  '
+patterns: []

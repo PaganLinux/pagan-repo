@@ -1,0 +1,31 @@
+name: dogtail
+version: 0.9.11
+release: 14
+source:
+- https://gitlab.com/dogtail/dogtail/raw/released/dogtail-0.9.11.tar.gz: 801a15b183916df5adadd50338e82f76426b5b598477d2dc5e2258b1ce47236b
+homepage: https://gitlab.com/dogtail/dogtail/
+license: GPL-2.0-or-later
+summary: dogtail is a GUI test tool and automation framework written in Python
+description: 'GUI test tool and automation framework that uses assistive technologies to communicate with desktop applications.
+
+  '
+component: programming.tools
+category: other
+builddeps:
+- pkgconfig(python3)
+- python-build
+- python-installer
+- python-setuptools
+rundeps:
+- pyatspi2
+- python-gobject
+setup: ''
+build: '%python3_setup
+
+  '
+install: '%python3_install
+
+  install -Dm00644 $pkgfiles/com.gitlab.dogtail.metainfo.xml $installdir/usr/share/metainfo/com.gitlab.dogtail.metainfo.xml
+
+  '
+patterns: []

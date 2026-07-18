@@ -1,0 +1,73 @@
+name: digikam
+version: 9.1.0
+release: 68
+source:
+- https://download.kde.org/stable/digikam/9.1.0/digiKam-9.1.0.tar.xz: a7309191e9a4787853cb3ac4136e4f8d7c044b40338dc42c7e422c37625b72e1
+homepage: https://www.digikam.org/
+license:
+- GPL-2.0-or-later
+- LGPL-2.1-or-later
+summary: Advanced digital photo management application
+description: 'digiKam is an advanced digital photo management application for KDE, which makes importing and organizing digital
+  photos a ''snap''.
+
+  '
+component: multimedia.graphics
+category: other
+builddeps:
+- pkgconfig(ImageMagick)
+- pkgconfig(KF6CalendarCore)
+- pkgconfig(Qt6Multimedia)
+- pkgconfig(Qt6NetworkAuth)
+- pkgconfig(Qt6StateMachine)
+- pkgconfig(Qt6Svg)
+- pkgconfig(Qt6WebEngineCore)
+- pkgconfig(eigen3)
+- pkgconfig(exiv2)
+- pkgconfig(jasper)
+- pkgconfig(lcms2)
+- pkgconfig(lensfun)
+- pkgconfig(libavformat)
+- pkgconfig(libgphoto2)
+- pkgconfig(libheif)
+- pkgconfig(libjxl)
+- pkgconfig(libpng)
+- pkgconfig(libtiff-4)
+- pkgconfig(libturbojpeg)
+- pkgconfig(libxslt)
+- pkgconfig(opencv4)
+- akonadi-contacts-devel
+- breeze-devel
+- breeze-icons-devel
+- kf6-kcontacts-devel
+- kf6-kfilemetadata-devel
+- kf6-kiconthemes-devel
+- kf6-kio-devel
+- kf6-knotifications-devel
+- kf6-knotifyconfig-devel
+- kf6-sonnet-devel
+- kf6-threadweaver-devel
+- libboost-devel
+- libksane-devel
+- qt6-base-private-devel
+rundeps:
+- breeze
+- breeze-icons
+- perl-image-exiftool
+setup: "%cmake_ninja \\\n    -DBUILD_TESTING=OFF \\\n    -DBUILD_WITH_QT6=ON \\\n    -DENABLE_KFILEMETADATASUPPORT=ON \\\n\
+  \    -DENABLE_AKONADICONTACTSUPPORT=ON \\\n    -DENABLE_APPSTYLES=ON \\\n    -DENABLE_GEOLOCATION=ON\n"
+build: '%ninja_build
+
+  '
+install: '%ninja_install
+
+
+  # Due to SC limitation
+
+  rm -v $installdir/usr/share/metainfo/org.kde.showfoto.appdata.xml
+
+
+  %install_license LICENSES/*
+
+  '
+patterns: []

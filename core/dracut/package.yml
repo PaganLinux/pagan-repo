@@ -1,0 +1,33 @@
+name: dracut
+version: '105'
+release: 66
+source:
+- https://github.com/dracut-ng/dracut-ng/archive/refs/tags/105.tar.gz: a5f94012873f589e2efc3659341f5e383ec90419f5c361a6fd3561f946133f69
+homepage: https://github.com/dracut-ng/dracut-ng
+license:
+- GPL-2.0-or-later
+- GPL-2.0-only
+- LGPL-2.1-or-later
+summary: initramfs system
+description: 'dracut is an event driven initramfs infrastructure. dracut (the tool) is used to create an initramfs image by
+  copying tools and files from an installed system and combining it with the dracut framework
+
+  '
+component: system.boot
+category: core
+builddeps:
+- pkgconfig(libkmod)
+- asciidoc
+rundeps: []
+setup: '%apply_patches
+
+  %configure
+
+  '
+build: '%make
+
+  '
+install: "%make_install\n# unsupported on Solus\nrm -rf $installdir/%libdir%/dracut/modules.d/00dash\n\n# Statelessness\n\
+  rm -v $installdir/etc/dracut.conf\nrmdir -v $installdir/etc/dracut.conf.d \\\n         $installdir/etc/\n"
+patterns:
+- /usr/share/pkgconfig/dracut.pc

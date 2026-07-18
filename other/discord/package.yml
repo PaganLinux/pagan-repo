@@ -1,0 +1,48 @@
+name: discord
+version: 1.0.149
+release: 170
+source:
+- https://dl.discordapp.net/apps/linux/1.0.149/discord-1.0.149.tar.gz: 0408062bfee2ffc043c83ec9a8fd4dce752ddd789ba64919b267d246e60e5c86
+homepage: https://discord.com/
+license: Distributable
+summary: All-in-one voice and text chat for gamers
+description: 'All-in-one voice and text chat for gamers that''s free, secure, and works on both your desktop and phone.
+
+  '
+component: network.im
+category: other
+builddeps:
+- pkgconfig(alsa)
+- pkgconfig(gbm)
+- pkgconfig(gtk+-3.0)
+- pkgconfig(xshmfence)
+rundeps:
+- libayatana-appindicator
+- opus
+setup: ''
+build: ''
+install: '_discord_root=/usr/share/discord
+
+  _discord_install=${installdir}/$_discord_root
+
+
+  install -Dm00755 discord -t $_discord_install
+
+  install -Dm00755 updater_bootstrap -t $_discord_install
+
+
+  install -dm00755 ${installdir}/usr/bin
+
+  ln -srv $_discord_install/discord ${installdir}/usr/bin/discord
+
+
+  # Desktop file, icon, metainfo
+
+  install -Dm00755 ${pkgfiles}/discord.desktop ${installdir}/usr/share/applications/com.discordapp.Discord.desktop
+
+  install -Dm00755 discord.png ${installdir}/usr/share/icons/hicolor/256x256/apps/discord.png
+
+  install -Dm00644 ${pkgfiles}/discord.appdata.xml ${installdir}/usr/share/metainfo/com.discordapp.Discord.metainfo.xml
+
+  '
+patterns: []

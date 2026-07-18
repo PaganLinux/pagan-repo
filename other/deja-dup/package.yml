@@ -1,0 +1,44 @@
+name: deja-dup
+version: '50.1'
+release: 40
+source:
+- https://gitlab.gnome.org/World/deja-dup/-/archive/50.1/deja-dup-50.1.tar.gz: 997c506c0630b67148a334bf22b9f398bedaf085c32c4c3d5d7f1b3a84d19152
+homepage: https://apps.gnome.org/DejaDup/
+license: GPL-3.0-or-later
+summary: Déjà Dup backup tool
+description: 'Déjà Dup is a simple backup tool. It hides the complexity of backing up the Right Way (encrypted, off-site,
+  and regular) and uses duplicity as the backend.
+
+  '
+component: system.utils
+category: other
+builddeps:
+- pkgconfig(blueprint-compiler)
+- pkgconfig(gtk4)
+- pkgconfig(json-glib-1.0)
+- pkgconfig(libadwaita-1)
+- pkgconfig(libsecret-1)
+- pkgconfig(libsoup-3.0)
+- pkgconfig(wayland-client)
+- desktop-file-utils
+- itstool
+- vala
+rundeps:
+- duplicity
+- gvfs
+- rclone
+- restic
+setup: '%meson_configure -Denable_restic=true
+
+  '
+build: '%ninja_build
+
+  '
+install: '%ninja_install
+
+  mv $installdir/etc/xdg $installdir/usr/share/xdg
+
+  rmdir $installdir/etc
+
+  '
+patterns: []

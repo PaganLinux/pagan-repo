@@ -1,0 +1,66 @@
+name: darkly
+version: 0.5.36
+release: 14
+source:
+- https://github.com/Bali10050/Darkly/archive/refs/tags/v0.5.36.tar.gz: 7cc54dd4b94fa71f52d0836605966b73196497b68b9ac3f2f0b80c2c26d7d8d0
+homepage: https://github.com/Bali10050/Darkly
+license: GPL-2.0-or-later
+summary: A modern style for Qt applications.
+description: 'Fork of Lightly (A modern style for Qt applications)
+
+  '
+component: desktop.theme
+category: other
+builddeps:
+- pkgconfig(KF6GuiAddons)
+- pkgconfig(KF6WindowSystem)
+- pkgconfig(Qt5Quick)
+- pkgconfig(Qt6Quick)
+- frameworkintegration-devel
+- kcmutils-devel
+- kconfig-devel
+- kcoreaddons-devel
+- kdecoration-devel
+- kf6-frameworkintegration-devel
+- kf6-kcmutils-devel
+- kf6-kcolorscheme-devel
+- kf6-kconfig-devel
+- kf6-kcoreaddons-devel
+- kf6-ki18n-devel
+- kf6-kiconthemes-devel
+- kf6-kirigami-devel
+- kguiaddons-devel
+- ki18n-devel
+- kiconthemes-devel
+- kirigami2-devel
+- kwindowsystem-devel
+rundeps:
+- frameworkintegration
+- kcmutils
+- kcoreaddons
+- kdeclarative
+- kf6-frameworkintegration
+- kf6-kdeclarative
+- kf6-kirigami
+- ki18n
+- kirigami2
+setup: '%cmake_ninja
+
+  '
+build: '%ninja_build
+
+  '
+install: '%ninja_install
+
+
+  # Install appstream metadata
+
+  install -Dm00644 $pkgfiles/io.github.bali10050.darkly.metainfo.xml -t $installdir/usr/share/metainfo
+
+
+  # Install Licence
+
+  %install_license COPYING
+
+  '
+patterns: []

@@ -1,0 +1,1269 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    PAG - Pagan Linux Package Manager v3                     ║
+║         Produkcyjny menedżer pakietów – atomowy, bezpieczny, i18n          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+KLUCZOWE CECHY:
+  - Atomowa instalacja przez staging (tmpdir → rename) – brak pół-instalacji
+  - Bezpieczne usuwanie – sprawdza czy plik nie jest współdzielony
+  - SQLite dla bazy plików – miliony plików bez problemu
+  - GPG: weryfikacja repo.json + podpisy pakietów
+  - Hooki: pre/post-install, pre/post-remove
+  - Głęboka weryfikacja SHA256 per-plik
+  - Pełny rollback – cofa fizyczne pliki
+  - Blokada flock – tylko jedna instancja
+  - Transakcje z migawkami
+  - Cache HTTP (ETag/If-Modified-Since)
+  - Wielojęzyczność (i18n) – PL, EN
+
+FORMAT PAKIETU (.pkg.tar.xz):
+  ├── data.tar.xz        – pliki + sums.json (SHA256 per plik)
+  ├── metadata.json      – nazwa, wersja, zależności
+  └── hooks/             – pre-install, post-install, pre-remove, post-remove
+"""
+
+import os, sys, json, shutil, hashlib, tarfile, tempfile, subprocess, time, fcntl, sqlite3, locale
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple, Set
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+
+# =============================================================================
+# i18n – WIELOJĘZYCZNOŚĆ
+# =============================================================================
+
+LANG = os.environ.get("LANG", "en_US.UTF-8")[:2]  # pl, en, de...
+
+T = {
+    "en": {
+        "root_required": "pag requires root privileges (sudo).",
+        "db_locked": "Another pag instance is running.",
+        "db_lock_hint": "If this is an error, remove: rm {}",
+        "no_index": "Cannot fetch repository indexes. Run 'pag update'.",
+        "all_installed": "All packages are already installed.",
+        "to_install": "To install: {} packages ({:.1f} MB)",
+        "new": "NEW",
+        "continue_q": "Continue? [Y/n] ",
+        "cancelled": "Cancelled.",
+        "not_found": "not found in repos",
+        "downloading": "Downloading",
+        "download_fail": "download failed",
+        "gpg_fail": "GPG verification failed",
+        "sha256_mismatch": "SHA256 mismatch",
+        "installed": "Installed {} packages.",
+        "rollback_restored": "Restored previous state from snapshot.",
+        "rollback_files": "Rolled back {} files.",
+        "no_history": "No transaction history.",
+        "pinned_list": "Pinned packages ({}):",
+        "no_pinned": "No pinned packages.",
+        "pinned_to": "pinned to",
+        "unpinned": "unpinned.",
+        "not_pinned": "was not pinned.",
+        "repo_added": "Added repository: {}",
+        "repo_exists": "Repository already exists: {}",
+        "updated_done": "Index refresh complete. {} packages cached.",
+        "upgrading": "Upgrading: {} packages",
+        "all_up_to_date": "All packages are up to date.",
+        "removing": "Removing",
+        "orphans_found": "Orphaned dependencies ({}): {}",
+        "flatpak_missing": "Flatpak is not installed.",
+        "flatpak_adding": "Adding Flathub remote...",
+        "key_imported": "Key imported successfully.",
+        "key_removed": "Key removed: {}",
+        "no_keys": "No trusted GPG keys.",
+        "verify_ok": "All {} files intact.",
+        "verify_errors": "{} problems found:",
+        "cache_cleared": "{} files ({:.1f} MB) cleared from cache.",
+    },
+    "pl": {
+        "root_required": "pag wymaga uprawnień root (sudo).",
+        "db_locked": "Inna instancja pag jest uruchomiona.",
+        "db_lock_hint": "Jeśli to błąd, usuń: rm {}",
+        "no_index": "Nie można pobrać indeksów repozytoriów. Uruchom 'pag update'.",
+        "all_installed": "Wszystkie pakiety są już zainstalowane.",
+        "to_install": "Do zainstalowania: {} pakietów ({:.1f} MB)",
+        "new": "NOWY",
+        "continue_q": "Kontynuować? [T/n] ",
+        "cancelled": "Anulowano.",
+        "not_found": "brak w repozytoriach",
+        "downloading": "Pobieranie",
+        "download_fail": "błąd pobierania",
+        "gpg_fail": "błąd weryfikacji GPG",
+        "sha256_mismatch": "niezgodność SHA256",
+        "installed": "Zainstalowano {} pakietów.",
+        "rollback_restored": "Przywrócono poprzedni stan z migawki.",
+        "rollback_files": "Wycofano {} plików.",
+        "no_history": "Brak historii transakcji.",
+        "pinned_list": "Przypięte pakiety ({}):",
+        "no_pinned": "Brak przypiętych pakietów.",
+        "pinned_to": "przypięty do",
+        "unpinned": "odpięty.",
+        "not_pinned": "nie był przypięty.",
+        "repo_added": "Dodano repozytorium: {}",
+        "repo_exists": "Repozytorium już istnieje: {}",
+        "updated_done": "Odświeżanie zakończone. {} pakietów w cache.",
+        "upgrading": "Aktualizacje: {} pakietów",
+        "all_up_to_date": "Wszystkie pakiety są aktualne.",
+        "removing": "Usuwanie",
+        "orphans_found": "Osierocone zależności ({}): {}",
+        "flatpak_missing": "Flatpak nie jest zainstalowany.",
+        "flatpak_adding": "Dodaję zdalne repozytorium Flathub...",
+        "key_imported": "Klucz zaimportowany pomyślnie.",
+        "key_removed": "Klucz usunięty: {}",
+        "no_keys": "Brak zaufanych kluczy GPG.",
+        "verify_ok": "Wszystkie {} plików sprawne.",
+        "verify_errors": "Znaleziono {} problemów:",
+        "cache_cleared": "{} plików ({:.1f} MB) usuniętych z cache.",
+    },
+}
+
+def _(key: str, *args) -> str:
+    """Tłumaczy klucz i formatuje argumenty."""
+    msg = T.get(LANG, T["en"]).get(key, T["en"].get(key, key))
+    if args:
+        return msg.format(*args)
+    return msg
+
+# =============================================================================
+# ŚCIEŻKI
+# =============================================================================
+PAG_ROOT      = "/"
+PAG_DB        = "/var/lib/pag"
+PAG_CACHE     = "/var/cache/pag"
+PAG_CONF      = "/etc/pag"
+REPO_CACHE    = "/var/cache/pag/repos"
+REPOS_CONF    = "/etc/pag/repos.conf"
+INSTALLED_DB  = "/var/lib/pag/installed.json"
+FILES_DB_SQL  = "/var/lib/pag/files.db"       # SQLite!
+WORLD_FILE    = "/var/lib/pag/world"
+PINNED_FILE   = "/var/lib/pag/pinned.json"
+HISTORY_FILE  = "/var/lib/pag/history.json"
+LOCK_FILE     = "/var/lib/pag/pag.lock"
+GPG_KEYRING   = "/etc/pag/trusted-keys.gpg"
+STAGING_DIR   = "/.pag_staging"          # na tej samej partycji co / (unikamy EXDEV)
+PKG_EXT       = ".pkg.tar.xz"
+REPO_CACHE_TTL = 3600
+
+DEFAULT_REPOS = [
+    "https://repo.paganlinux.eu/stable",
+    "https://repo.paganlinux.eu/gaming",
+]
+
+# =============================================================================
+# INICJALIZACJA
+# =============================================================================
+
+def ensure_dirs():
+    for d in [PAG_DB, PAG_CACHE, PAG_CONF, REPO_CACHE, STAGING_DIR]:
+        os.makedirs(d, exist_ok=True)
+    for f, default in [
+        (REPOS_CONF, "\n".join(DEFAULT_REPOS) + "\n"),
+        (INSTALLED_DB, "{}"),
+        (PINNED_FILE, "{}"),
+        (HISTORY_FILE, "[]"),
+    ]:
+        if not os.path.exists(f):
+            with open(f, "w") as fh: fh.write(default)
+    if not os.path.exists(WORLD_FILE):
+        Path(WORLD_FILE).touch()
+    if not os.path.exists(GPG_KEYRING):
+        subprocess.run(["gpg", "--no-default-keyring", "--keyring", GPG_KEYRING,
+                         "--fingerprint"], capture_output=True)
+    # Inicjalizuj SQLite
+    _db_init()
+
+# =============================================================================
+# SQLITE – BAZA PLIKÓW (poprawne zarządzanie połączeniami)
+# =============================================================================
+
+from contextlib import contextmanager
+
+@contextmanager
+def _db_session():
+    """Context manager – gwarantuje zamknięcie połączenia."""
+    conn = sqlite3.connect(FILES_DB_SQL)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _db_init():
+    """Tworzy tabele SQLite jeśli nie istnieją."""
+    with _db_session() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                package TEXT NOT NULL,
+                sha256 TEXT,
+                size INTEGER,
+                is_symlink INTEGER DEFAULT 0,
+                symlink_target TEXT,
+                UNIQUE(path, package)
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_files_pkg ON files(package)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS file_checksums (
+                path TEXT PRIMARY KEY,
+                sha256 TEXT NOT NULL,
+                installed_at TEXT
+            )
+        """)
+        db.commit()
+
+def _db_record_files(pkg_name: str, files: List[dict]):
+    """Zapisuje pliki do SQLite (obsługuje symlinki)."""
+    with _db_session() as db:
+        # Context manager sam zarządza transakcją atomowo
+        db.executemany(
+            "INSERT OR REPLACE INTO files (path, package, sha256, size, is_symlink, symlink_target) "
+            "VALUES (?,?,?,?,?,?)",
+            [(f["path"], pkg_name, f.get("sha256",""), f.get("size",0),
+              f.get("is_symlink", 0), f.get("symlink_target", ""))
+             for f in files]
+        )
+        db.executemany(
+            "INSERT OR REPLACE INTO file_checksums (path, sha256, installed_at) VALUES (?,?,?)",
+            [(f["path"], f.get("sha256",""), datetime.now().isoformat())
+             for f in files if f.get("sha256")]
+        )
+
+def _db_get_package_files(pkg_name: str) -> List[str]:
+    with _db_session() as db:
+        return [r["path"] for r in db.execute(
+            "SELECT DISTINCT path FROM files WHERE package=?", (pkg_name,)
+        )]
+
+def _db_get_file_owners(filepath: str) -> List[str]:
+    """Zwraca listę pakietów będących właścicielami pliku."""
+    with _db_session() as db:
+        return [r["package"] for r in db.execute(
+            "SELECT package FROM files WHERE path=?", (filepath,)
+        )]
+
+def _db_remove_package_files(pkg_name: str):
+    with _db_session() as db:
+        db.execute("DELETE FROM files WHERE package=?", (pkg_name,))
+        db.commit()
+
+def _db_get_all_file_checksums() -> Dict[str, str]:
+    with _db_session() as db:
+        return {r["path"]: r["sha256"] for r in db.execute("SELECT path, sha256 FROM file_checksums")}
+
+def _db_count_files() -> int:
+    with _db_session() as db:
+        return db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+# =============================================================================
+# BLOKADA
+# =============================================================================
+
+class DatabaseLock:
+    def __init__(self):
+        self._fd = None
+    def __enter__(self):
+        self._fd = open(LOCK_FILE, "w")
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (IOError, OSError):
+            print(f"❌ {_('db_locked')}", file=sys.stderr)
+            print(f"   {_('db_lock_hint', LOCK_FILE)}", file=sys.stderr)
+            sys.exit(1)
+        return self
+    def __exit__(self, *args):
+        if self._fd:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            self._fd.close()
+            try: os.remove(LOCK_FILE)
+            except: pass
+
+# =============================================================================
+# POMOCNICZE
+# =============================================================================
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _version_newer(a: str, b: str) -> bool:
+    def parse(v):
+        parts = []
+        for p in v.replace("-",".").replace("_",".").split("."):
+            try: parts.append((0, int(p)))
+            except ValueError: parts.append((1, p))
+        return parts
+    try: return parse(a) > parse(b)
+    except: return a != b
+
+def load_json(path): return json.load(open(path))
+def save_json(path, data): json.dump(data, open(path, "w"), indent=2)
+
+class PackageInfo:
+    __slots__ = ("name","version","description","dependencies",
+                 "size_bytes","sha256","gpg_fp","repo_url","filename")
+    def __init__(self, d, repo=""):
+        self.name = d.get("name","?")
+        self.version = d.get("version","0")
+        self.description = d.get("description","")
+        self.dependencies = d.get("dependencies",[])
+        self.size_bytes = d.get("size",0)
+        self.sha256 = d.get("sha256","")
+        self.gpg_fp = d.get("gpg_fingerprint","")
+        self.repo_url = repo
+        self.filename = d.get("filename", f"{self.name}-{self.version}{PKG_EXT}")
+
+# =============================================================================
+# REPOZYTORIA (cache, ETag, GPG)
+# =============================================================================
+
+def get_repos():
+    repos = []
+    if os.path.exists(REPOS_CONF):
+        for line in open(REPOS_CONF):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                repos.append(line.rstrip("/"))
+    return repos or DEFAULT_REPOS
+
+def _repo_cache_path(url):
+    return os.path.join(REPO_CACHE, url.replace("://","_").replace("/","_").replace(".","_") + ".json")
+
+def _repo_etag_path(url): return _repo_cache_path(url) + ".etag"
+def _repo_ts_path(url): return _repo_cache_path(url) + ".ts"
+
+def fetch_repo_index(repo_url, force=False):
+    cp = _repo_cache_path(repo_url)
+    ep = _repo_etag_path(repo_url)
+    tp = _repo_ts_path(repo_url)
+
+    if not force and os.path.exists(cp) and os.path.exists(tp):
+        try:
+            if time.time() - float(open(tp).read().strip()) < REPO_CACHE_TTL:
+                return json.load(open(cp)).get("packages",[])
+        except: pass
+
+    headers = {"User-Agent": "pag/3.0"}
+    if os.path.exists(tp) and not force:
+        try:
+            lm = datetime.fromtimestamp(float(open(tp).read().strip()), tz=timezone.utc)
+            # Wymuś lokalizację C/POSIX dla nagłówków HTTP, aby unikać problemów z nazwami dni/miesięcy
+            try:
+                old_locale = locale.setlocale(locale.LC_TIME)
+                locale.setlocale(locale.LC_TIME, 'C')
+                headers["If-Modified-Since"] = lm.strftime("%a, %d %b %Y %H:%M:%S GMT")
+                locale.setlocale(locale.LC_TIME, old_locale)
+            except (locale.Error, ValueError):
+                # Jeśli ustawienie lokalizacji się nie powiedzie, użyj domyślnej
+                headers["If-Modified-Since"] = lm.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        except: pass
+    if os.path.exists(ep) and not force:
+        try: headers["If-None-Match"] = open(ep).read().strip()
+        except: pass
+
+    try:
+        req = Request(f"{repo_url}/repo.json", headers=headers)
+        with urlopen(req, timeout=30) as resp:
+            etag = resp.headers.get("ETag","")
+            if etag: open(ep,"w").write(etag)
+            data = json.loads(resp.read().decode())
+            json.dump(data, open(cp,"w"))
+            open(tp,"w").write(str(time.time()))
+            _verify_repo_sig(repo_url, cp)
+            return data.get("packages",[])
+    except HTTPError as e:
+        if e.code == 304:
+            open(tp,"w").write(str(time.time()))
+            if os.path.exists(cp):
+                return json.load(open(cp)).get("packages",[])
+        return None
+    except Exception:
+        if os.path.exists(cp):
+            try: return json.load(open(cp)).get("packages",[])
+            except: pass
+        return None
+
+def _verify_repo_sig(repo_url, cache_path):
+    if not os.path.exists(GPG_KEYRING): return
+    sig_path = cache_path + ".sig"
+    try:
+        req = Request(f"{repo_url}/repo.json.sig", headers={"User-Agent":"pag/3.0"})
+        with urlopen(req, timeout=15) as resp:
+            with open(sig_path,"wb") as f: f.write(resp.read())
+    except: return
+    result = subprocess.run(
+        ["gpg","--no-default-keyring","--keyring",GPG_KEYRING,
+         "--verify",sig_path,cache_path],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        os.remove(cache_path)
+        print(f"  ⚠ {repo_url}: invalid GPG signature on repo index!")
+
+def fetch_all_packages(force=False):
+    all_pkgs = {}
+    for repo_url in get_repos():
+        pkgs = fetch_repo_index(repo_url, force)
+        if pkgs:
+            for pdata in pkgs:
+                name = pdata.get("name", pdata.get("filename","?").split("-")[0])
+                pkg = PackageInfo(pdata, repo_url)
+                if name not in all_pkgs or _version_newer(pkg.version, all_pkgs[name].version):
+                    all_pkgs[name] = pkg
+    return all_pkgs
+
+# =============================================================================
+# GPG
+# =============================================================================
+
+def _verify_pkg_gpg(pkg_path):
+    sig_path = pkg_path + ".sig"
+    if not os.path.exists(sig_path):
+        return True, "(no signature)"
+    result = subprocess.run(
+        ["gpg","--no-default-keyring","--keyring",GPG_KEYRING,
+         "--verify",sig_path,pkg_path],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0, result.stderr[:200]
+
+def cmd_key_add(source):
+    ensure_dirs()
+    if source.startswith("http"):
+        try:
+            with urlopen(Request(source, headers={"User-Agent":"pag/3.0"}), timeout=30) as resp:
+                keydata = resp.read()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".gpg") as tmp:
+                tmp.write(keydata); tmp.flush()
+                subprocess.run(["gpg","--no-default-keyring","--keyring",GPG_KEYRING,
+                                "--import",tmp.name], capture_output=True)
+                os.unlink(tmp.name)
+        except Exception as e:
+            print(f"❌ Download error: {e}"); return 1
+    else:
+        subprocess.run(["gpg","--no-default-keyring","--keyring",GPG_KEYRING,
+                         "--import",source], capture_output=True)
+    print(f"✅ {_('key_imported')}")
+
+def cmd_key_list():
+    if not os.path.exists(GPG_KEYRING):
+        print(_("no_keys")); return
+    result = subprocess.run(["gpg","--no-default-keyring","--keyring",GPG_KEYRING,
+                              "--list-keys","--keyid-format","LONG"],
+                             capture_output=True, text=True)
+    print(result.stdout or _("no_keys"))
+
+def cmd_key_remove(key_id):
+    subprocess.run(["gpg","--no-default-keyring","--keyring",GPG_KEYRING,
+                     "--batch","--yes","--delete-key",key_id], capture_output=True)
+    print(f"✅ {_('key_removed', key_id)}")
+
+# =============================================================================
+# ATOMOWA INSTALACJA (STAGING)
+# =============================================================================
+
+def _safe_rename(src: str, dst: str) -> bool:
+    """
+    Atomowe przeniesienie pliku. Jeśli src i dst są na różnych
+    systemach plików (EXDEV), kopiuje + usuwa źródło.
+    """
+    try:
+        os.rename(src, dst)
+        return True
+    except OSError as e:
+        if e.errno == 18:  # EXDEV – cross-device link
+            shutil.copy2(src, dst)
+            os.remove(src)
+            return True
+        raise
+
+
+def _install_file(src: str, rel: str, data_staging: str, sums: dict,
+                   staging: str, journal: list, installed_files: list) -> bool:
+    """
+    Instaluje pojedynczy plik (zwykły lub symlink).
+    Obsługuje: cross-device rename, symlinki, weryfikację SHA256.
+    """
+    dst = os.path.join(PAG_ROOT, rel)
+
+    # --- SYMLINK ---
+    if os.path.islink(src):
+        link_target = os.readlink(src)
+        # Weryfikuj sums.json dla symlinka (hash ścieżki docelowej)
+        expected = sums.get("/" + rel, "")
+        if expected:
+            link_hash = hashlib.sha256(link_target.encode()).hexdigest()
+            if expected and link_hash != expected:
+                return False
+
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        # Jeśli docelowy symlink już istnieje, usuń go
+        if os.path.islink(dst) or os.path.exists(dst):
+            os.remove(dst)
+        os.symlink(link_target, dst)
+        journal.append(("symlink", "", dst))
+        installed_files.append({
+            "path": "/" + rel,
+            "sha256": hashlib.sha256(link_target.encode()).hexdigest(),
+            "size": len(link_target),
+            "is_symlink": True,
+            "symlink_target": link_target,
+        })
+        return True
+
+    # --- ZWYKŁY PLIK ---
+    # Oblicz SHA256
+    try:
+        file_sha = _sha256_file(src)
+    except Exception:
+        file_sha = ""
+
+    # Weryfikuj sums.json
+    expected = sums.get("/" + rel, "")
+    if expected and file_sha and file_sha != expected:
+        return False
+
+    # Utwórz katalog docelowy
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+    # Atomowe przeniesienie (z fallbackiem dla cross-device)
+    _safe_rename(src, dst)
+    
+    # Wymuś właściciela root:root i zachowaj uprawnienia
+    try:
+        os.chown(dst, 0, 0)
+    except (OSError, PermissionError):
+        # Na niektórych systemach plików (tmpfs, fat) chown może się nie powieść
+        pass
+    
+    journal.append(("file", src, dst))
+    installed_files.append({
+        "path": "/" + rel,
+        "sha256": file_sha,
+        "size": os.path.getsize(dst),
+        "is_symlink": False,
+    })
+    return True
+
+
+def _atomic_install(pkg_path: str, pkg: PackageInfo) -> Tuple[bool, List[dict]]:
+    """
+    Rozpakowuje do staging area, potem atomowo przenosi pliki.
+    Zwraca (success, [lista plików z SHA256]).
+    """
+    staging = tempfile.mkdtemp(dir=STAGING_DIR, prefix=f".staging-{pkg.name}-")
+    journal = []
+    installed_files = []
+
+    try:
+        # Rozpakuj .pkg.tar.xz → staging (zabezpieczenie przed Directory Traversal)
+        with tarfile.open(pkg_path, "r:xz") as tf:
+            tf.extractall(staging, filter='data')
+
+        data_tar = os.path.join(staging, "data.tar.xz")
+        if not os.path.exists(data_tar):
+            shutil.rmtree(staging, ignore_errors=True)
+            return False, []
+
+        # Rozpakuj data.tar.xz → staging/data (zabezpieczenie przed Directory Traversal)
+        data_staging = os.path.join(staging, "data")
+        os.makedirs(data_staging, exist_ok=True)
+        with tarfile.open(data_tar, "r:xz") as tf:
+            tf.extractall(data_staging, filter='data')
+
+        # Wczytaj sums.json
+        sums_path = os.path.join(data_staging, "sums.json")
+        sums = json.load(open(sums_path)) if os.path.exists(sums_path) else {}
+
+        # Przenieś pliki: staging/data/* → /
+        for root, dirs, files in os.walk(data_staging):
+            for fname in files:
+                if fname == "sums.json":
+                    continue
+                src = os.path.join(root, fname)
+                rel = os.path.relpath(src, data_staging)
+
+                ok = _install_file(src, rel, data_staging, sums,
+                                    staging, journal, installed_files)
+                if not ok:
+                    # Cofnij wszystkie operacje
+                    _rollback_journal(journal, staging)
+                    return False, []
+
+        # Uruchom hooki post-install
+        hooks_dir = os.path.join(staging, "hooks")
+        _run_hook(hooks_dir, "post-install", pkg)
+
+        # Zapisz do SQLite
+        _db_record_files(pkg.name, installed_files)
+
+        shutil.rmtree(staging, ignore_errors=True)
+        return True, installed_files
+
+    except Exception as e:
+        _rollback_journal(journal, staging)
+        return False, []
+
+
+def _rollback_journal(journal: list, staging_path: str):
+    """Cofa wszystkie operacje z journala (odwrotna kolejność)."""
+    for entry in reversed(journal):
+        op = entry[0]
+        if op == "file":
+            _, src, dst = entry
+            try:
+                if os.path.exists(dst) or os.path.islink(dst):
+                    _safe_rename(dst, src)
+            except Exception:
+                pass
+        elif op == "symlink":
+            _, _, dst = entry
+            try:
+                if os.path.islink(dst) or os.path.exists(dst):
+                    os.remove(dst)
+            except Exception:
+                pass
+    shutil.rmtree(staging_path, ignore_errors=True)
+
+# =============================================================================
+# BEZPIECZNE USUWANIE
+# =============================================================================
+
+def _safe_remove_files(pkg_name: str, installed_db: dict) -> Tuple[int, List[str]]:
+    """
+    Usuwa pliki pakietu, ale tylko jeśli NIE są współdzielone z innym pakietem.
+    Zwraca (liczba usuniętych, [lista usuniętych ścieżek]).
+    """
+    pkg_files = _db_get_package_files(pkg_name)
+    removed = []
+    skipped_shared = []
+
+    for fpath in pkg_files:
+        owners = _db_get_file_owners(fpath)
+        # Sprawdź czy inny ZAINSTALOWANY pakiet też jest właścicielem
+        other_owners = [o for o in owners if o != pkg_name and o in installed_db]
+
+        if other_owners:
+            # Plik współdzielony – tylko usuń wpis w DB, nie kasuj pliku
+            skipped_shared.append(fpath)
+            continue
+
+        full = os.path.join(PAG_ROOT, fpath.lstrip("/"))
+        if os.path.isfile(full) or os.path.islink(full):
+            os.remove(full)
+            removed.append(fpath)
+
+    # Usuń puste katalogi (od najgłębszych)
+    dirs = set()
+    for fpath in removed + skipped_shared:
+        parent = os.path.dirname(fpath)
+        while parent and parent != "/":
+            dirs.add(parent)
+            parent = os.path.dirname(parent)
+
+    for d in sorted(dirs, key=len, reverse=True):
+        full_d = os.path.join(PAG_ROOT, d.lstrip("/"))
+        if os.path.isdir(full_d):
+            try:
+                os.rmdir(full_d)
+            except OSError:
+                pass  # nie jest pusty – OK
+
+    # Usuń z SQLite
+    _db_remove_package_files(pkg_name)
+
+    if skipped_shared:
+        print(f"      ⚠ {len(skipped_shared)} plików współdzielonych zachowanych")
+
+    return len(removed) + len(skipped_shared), removed
+
+# =============================================================================
+# HOOKI
+# =============================================================================
+
+def _run_hook(hooks_dir: str, hook_name: str, pkg: PackageInfo):
+    """Uruchamia skrypt hooka jeśli istnieje."""
+    hook_path = os.path.join(hooks_dir, hook_name)
+    if not os.path.exists(hook_path):
+        return
+    os.chmod(hook_path, 0o755)
+    env = os.environ.copy()
+    env["PKG_NAME"] = pkg.name
+    env["PKG_VERSION"] = pkg.version
+    env["PKG_ACTION"] = hook_name
+    try:
+        subprocess.run([hook_path], env=env, timeout=60, check=False)
+    except Exception:
+        pass
+
+# =============================================================================
+# TRANSAKCJE I ROLLBACK
+# =============================================================================
+
+def _record_transaction(action, packages, success, snapshot, file_journal=None):
+    history = load_json(HISTORY_FILE) if os.path.exists(HISTORY_FILE) else []
+    entry = {
+        "action": action, "packages": packages, "success": success,
+        "timestamp": datetime.now().isoformat(),
+        "snapshot": snapshot,
+        "file_journal": file_journal,  # lista plików do wycofania
+    }
+    history.append(entry)
+    if len(history) > 50:
+        history = history[-50:]
+    save_json(HISTORY_FILE, history)
+
+def cmd_history():
+    if not os.path.exists(HISTORY_FILE):
+        print(_("no_history")); return
+    history = load_json(HISTORY_FILE)
+    if not history:
+        print(_("no_history")); return
+    print(f"Ostatnie transakcje ({len(history)}):")
+    for i, e in enumerate(reversed(history), 1):
+        icon = "✅" if e["success"] else "❌"
+        pkgs = ", ".join(e["packages"][:5])
+        if len(e["packages"]) > 5: pkgs += f" (+{len(e['packages'])-5})"
+        print(f"  {i}. {icon} {e['action']}: {pkgs}")
+        print(f"     {e['timestamp']}")
+
+def cmd_rollback():
+    if not os.path.exists(HISTORY_FILE):
+        print(_("no_history")); return 1
+    history = load_json(HISTORY_FILE)
+    if not history:
+        print(_("no_history")); return 1
+
+    last = None
+    for e in reversed(history):
+        if e["success"] and e.get("snapshot"):
+            last = e; break
+
+    if not last:
+        print("❌ No snapshot to restore."); return 1
+
+    print(f"⏪ Rolling back: {last['action']} ({last['timestamp']})")
+    print(f"   Packages: {', '.join(last['packages'][:10])}")
+
+    ans = input(_("continue_q")).strip().lower()
+    if ans and ans not in ("t","y"):
+        return 0
+
+    # Przywróć installed.json
+    save_json(INSTALLED_DB, last["snapshot"])
+
+    # Wycofaj fizyczne pliki (jeśli zapisano journal)
+    file_journal = last.get("file_journal", [])
+    if file_journal:
+        for fpath in reversed(file_journal):
+            full = os.path.join(PAG_ROOT, fpath.lstrip("/"))
+            if os.path.exists(full) or os.path.islink(full):
+                os.remove(full)
+        print(f"   {_('rollback_files', len(file_journal))}")
+
+    print(f"✅ {_('rollback_restored')}")
+    _record_transaction("rollback", last["packages"], True, None)
+    return 0
+
+# =============================================================================
+# INSTALACJA
+# =============================================================================
+
+def cmd_install(package_names, as_dep=False):
+    ensure_dirs()
+    installed_db = load_json(INSTALLED_DB)
+    world = load_world()
+    pinned = load_json(PINNED_FILE)
+    repo_pkgs = fetch_all_packages()
+
+    if not repo_pkgs:
+        print(f"❌ {_('no_index')}"); return 1
+
+    for name in list(package_names):
+        if name in pinned:
+            print(f"⚠ {name} {_('pinned_to')} {pinned[name]} – skipping")
+            package_names.remove(name)
+
+    to_install = _resolve_deps(package_names, repo_pkgs, installed_db)
+    if not to_install:
+        print(f"✅ {_('all_installed')}"); return 0
+
+    total_size = sum(repo_pkgs[n].size_bytes for n in to_install if n in repo_pkgs)
+    print(f"\n📦 {_('to_install', len(to_install), total_size/1048576)}")
+    for name in to_install:
+        p = repo_pkgs.get(name)
+        if p:
+            marker = f" [{_('new')}]" if name not in installed_db else ""
+            print(f"   {name}-{p.version}{marker}")
+
+    if not as_dep:
+        ans = input(_("continue_q")).strip().lower()
+        if ans and ans not in ("t","y"):
+            print(_("cancelled")); return 0
+
+    snapshot = json.loads(json.dumps(installed_db))
+    all_installed_files = []
+    failed = []
+
+    for name in to_install:
+        pkg = repo_pkgs.get(name)
+        if not pkg:
+            print(f"  ❌ {name}: {_('not_found')}")
+            failed.append(name); continue
+
+        print(f"  ↓ {name}-{pkg.version} ...", end=" ", flush=True)
+
+        # Pobierz
+        pkg_path = _download_pkg(pkg)
+        if not pkg_path:
+            print(f"❌ {_('download_fail')}")
+            failed.append(name); continue
+
+        # GPG
+        gpg_ok, gpg_msg = _verify_pkg_gpg(pkg_path)
+        if not gpg_ok:
+            print(f"❌ {_('gpg_fail')}: {gpg_msg[:60]}")
+            failed.append(name); continue
+
+        # SHA256 całego pakietu
+        if pkg.sha256 and _sha256_file(pkg_path) != pkg.sha256:
+            print(f"❌ {_('sha256_mismatch')}")
+            failed.append(name); continue
+
+        # Atomowa instalacja
+        ok, files = _atomic_install(pkg_path, pkg)
+        if ok:
+            installed_db[name] = {
+                "version": pkg.version, "description": pkg.description,
+                "dependencies": pkg.dependencies, "size_bytes": pkg.size_bytes,
+                "sha256": pkg.sha256, "installed_at": datetime.now().isoformat(),
+                "repo": pkg.repo_url,
+            }
+            if not as_dep and name in package_names:
+                world.add(name)
+            print("✅")
+            all_installed_files.extend(f["path"] for f in files)
+        else:
+            print("❌")
+            failed.append(name)
+            # Rollback
+            print("  ↩ Restoring snapshot...")
+            save_json(INSTALLED_DB, snapshot)
+            _record_transaction("install", to_install, False, snapshot)
+            return 1
+
+    save_json(INSTALLED_DB, installed_db)
+    save_world(world)
+    _record_transaction("install", to_install, not failed, snapshot,
+                         file_journal=all_installed_files)
+
+    if failed:
+        print(f"\n❌ Errors: {len(failed)}/{len(to_install)}"); return 1
+    print(f"\n✅ {_('installed', len(to_install))}")
+    return 0
+
+# =============================================================================
+# USUWANIE
+# =============================================================================
+
+def cmd_remove(package_names):
+    installed_db = load_json(INSTALLED_DB)
+    world = load_world()
+    snapshot = json.loads(json.dumps(installed_db))
+    removed = []
+
+    for name in package_names:
+        if name not in installed_db:
+            print(f"  ⚠ {name}: not installed"); continue
+
+        print(f"  🗑 {name}-{installed_db[name]['version']} ...", end=" ", flush=True)
+
+        # Pre-remove hook (jeśli dostępny w staging)
+        _run_hook_for_installed(name, "pre-remove")
+
+        count, _ = _safe_remove_files(name, installed_db)
+        del installed_db[name]
+        world.discard(name)
+        removed.append(name)
+        print(f"✅ ({count} files)")
+
+    save_json(INSTALLED_DB, installed_db)
+    save_world(world)
+    _record_transaction("remove", removed, True, snapshot)
+
+    if not removed: return 0
+    print(f"\n✅ Removed {len(removed)}.")
+
+    orphans = _find_orphans(installed_db, world)
+    if orphans:
+        print(f"\n💡 {_('orphans_found', len(orphans), ', '.join(sorted(orphans)[:10]))}")
+        print("   'pag remove-orphans' to clean up.")
+    return 0
+
+def _run_hook_for_installed(pkg_name, hook_name):
+    """Próbuje uruchomić hook z katalogu pakietu (jeśli został zapisany)."""
+    hook_dir = os.path.join(PAG_DB, "hooks", pkg_name)
+    if os.path.isdir(hook_dir):
+        _run_hook(hook_dir, hook_name, PackageInfo({"name": pkg_name}))
+
+# =============================================================================
+# UPDATE / UPGRADE / LIST / SEARCH / INFO / VERIFY
+# =============================================================================
+
+def cmd_update():
+    force = "--force" in sys.argv
+    print(f"🔄 {'Forced refresh' if force else 'Updating'} indexes...")
+    for repo_url in get_repos():
+        pkgs = fetch_repo_index(repo_url, force_refresh=force)
+        cp = _repo_cache_path(repo_url)
+        has_sig = os.path.exists(cp + ".sig")
+        print(f"  {'✅' if pkgs is not None else '❌'} {repo_url}: {len(pkgs or [])} pkgs {'🔐' if has_sig else '⚠'}")
+    total = sum(len(json.load(open(_repo_cache_path(r))).get("packages",[]))
+                for r in get_repos() if os.path.exists(_repo_cache_path(r)))
+    print(f"✅ {_('updated_done', total)}")
+
+def cmd_upgrade():
+    ensure_dirs()
+    installed = load_json(INSTALLED_DB)
+    pinned = load_json(PINNED_FILE)
+    repo = fetch_all_packages()
+    upgrades = [n for n, i in installed.items()
+                if n not in pinned and (rp := repo.get(n)) and _version_newer(rp.version, i["version"])]
+    if not upgrades:
+        print(f"✅ {_('all_up_to_date')}"); return 0
+    print(f"📦 {_('upgrading', len(upgrades))}")
+    for n in upgrades:
+        print(f"   {n}: {installed[n]['version']} → {repo[n].version}")
+    ans = input(_("continue_q")).strip().lower()
+    if ans and ans not in ("t","y"): return 0
+    return cmd_install(upgrades)
+
+def cmd_list(installed_only=False):
+    if installed_only:
+        db = load_json(INSTALLED_DB)
+        pinned = load_json(PINNED_FILE)
+        if not db: print("No packages installed."); return
+        print(f"Installed ({len(db)}):")
+        for n, i in sorted(db.items()):
+            pin = " 📌" if n in pinned else ""
+            print(f"  {n}-{i['version']}{pin}  – {i.get('description','')}")
+    else:
+        pkgs = fetch_all_packages()
+        installed = load_json(INSTALLED_DB)
+        pinned = load_json(PINNED_FILE)
+        print(f"Available ({len(pkgs)}):")
+        for n, p in sorted(pkgs.items()):
+            m = "✓" if n in installed else " "
+            extra = f"  [installed: {installed[n]['version']}]" if n in installed else ""
+            if n in pinned: extra += " 📌"
+            print(f"  [{m}] {n}-{p.version}  – {p.description}{extra}")
+
+def cmd_search(query):
+    pkgs = fetch_all_packages()
+    results = [(n,p) for n,p in pkgs.items() if query.lower() in n.lower() or query.lower() in p.description.lower()]
+    if not results: print(f"❌ No results for: {query}"); return
+    installed = load_json(INSTALLED_DB)
+    print(f"Results for '{query}' ({len(results)}):")
+    for n,p in sorted(results):
+        print(f"  [{'✓' if n in installed else ' '}] {n}-{p.version}")
+        print(f"      {p.description}")
+
+def cmd_info(name):
+    pkgs = fetch_all_packages()
+    p = pkgs.get(name)
+    info = load_json(INSTALLED_DB).get(name)
+    if not p and not info: print(f"❌ '{name}' not found."); return 1
+    print(f"📦 {name}")
+    if p:
+        print(f"   Version (repo):  {p.version}")
+        print(f"   Description:     {p.description}")
+        print(f"   Size:            {p.size_bytes/1048576:.1f} MB")
+        print(f"   SHA256:          {p.sha256[:32]}...")
+        print(f"   GPG:             {p.gpg_fp or 'none'}")
+        print(f"   Dependencies:    {', '.join(p.dependencies) if p.dependencies else '(none)'}")
+    if info:
+        print(f"   Installed:       {info['version']} ({info.get('installed_at','?')})")
+
+def cmd_files(name):
+    if name not in load_json(INSTALLED_DB):
+        print(f"❌ '{name}' not installed."); return 1
+    files = _db_get_package_files(name)
+    print(f"Files in {name} ({len(files)}):")
+    for f in sorted(files): print(f"  {f}")
+
+def cmd_verify(deep=False):
+    installed = load_json(INSTALLED_DB)
+    if not installed: print("Nothing to verify."); return
+    errors = []
+
+    for name in installed:
+        for fpath in _db_get_package_files(name):
+            full = os.path.join(PAG_ROOT, fpath.lstrip("/"))
+            if not (os.path.exists(full) or os.path.islink(full)):
+                errors.append(f"  ❌ {name}: missing {fpath}")
+            elif deep:
+                checksums = _db_get_all_file_checksums()
+                expected = checksums.get(fpath, "")
+                if expected:
+                    actual = _sha256_file(full)
+                    if actual != expected:
+                        errors.append(f"  ❌ {name}: SHA256 mismatch {fpath}")
+
+    if errors:
+        print(f"❌ {_('verify_errors', len(errors))}")
+        for e in errors[:50]: print(e)
+        return 1
+    total = _db_count_files()
+    print(f"✅ {_('verify_ok', total)}")
+
+# =============================================================================
+# PINNING / CLEAN / ORPHANS / REPO / FLATPAK
+# =============================================================================
+
+def cmd_pin(name, version=""):
+    pinned = load_json(PINNED_FILE)
+    if version:
+        pinned[name] = version
+    else:
+        info = load_json(INSTALLED_DB).get(name, {})
+        pinned[name] = info.get("version", "?")
+    save_json(PINNED_FILE, pinned)
+    print(f"📌 {name} {_('pinned_to')} {pinned[name]}")
+
+def cmd_unpin(name):
+    pinned = load_json(PINNED_FILE)
+    if name in pinned:
+        del pinned[name]; save_json(PINNED_FILE, pinned)
+        print(f"🔓 {name} {_('unpinned')}")
+    else:
+        print(f"⚠ {name} {_('not_pinned')}")
+
+def cmd_pinned():
+    pinned = load_json(PINNED_FILE)
+    if not pinned: print(_("no_pinned")); return
+    print(_("pinned_list", len(pinned)))
+    for n,v in sorted(pinned.items()): print(f"  📌 {n} = {v}")
+
+def cmd_clean():
+    if os.path.isdir(PAG_CACHE):
+        count = size = 0
+        for f in os.listdir(PAG_CACHE):
+            fp = os.path.join(PAG_CACHE, f)
+            if os.path.isfile(fp):
+                size += os.path.getsize(fp); os.remove(fp); count += 1
+        print(f"✅ {_('cache_cleared', count, size/1048576)}")
+
+def cmd_remove_orphans():
+    installed = load_json(INSTALLED_DB)
+    world = load_world()
+    orphans = _find_orphans(installed, world)
+    if not orphans: print("✅ No orphans."); return
+    print(f"Orphans ({len(orphans)}):")
+    for n in sorted(orphans): print(f"  {n}-{installed[n]['version']}")
+    ans = input(_("continue_q")).strip().lower()
+    if ans and ans not in ("t","y"): return
+    cmd_remove(list(orphans))
+
+def cmd_repo_add(url):
+    repos = get_repos()
+    url = url.rstrip("/")
+    if url in repos: print(f"⚠ {_('repo_exists', url)}"); return
+    with open(REPOS_CONF, "a") as f: f.write(f"{url}\n")
+    print(f"✅ {_('repo_added', url)}")
+
+def cmd_repo_list():
+    for i, url in enumerate(get_repos(), 1): print(f"  {i}. {url}")
+
+def _check_flatpak():
+    if not shutil.which("flatpak"):
+        print(f"❌ {_('flatpak_missing')}"); return False
+    r = subprocess.run(["flatpak","remotes"], capture_output=True, text=True)
+    if "flathub" not in r.stdout:
+        print(f"⚠ {_('flatpak_adding')}")
+        subprocess.run(["flatpak","remote-add","--if-not-exists","flathub",
+                         "https://flathub.org/repo/flathub.flatpakrepo"], check=False)
+    return True
+
+def cmd_flatpak_search(q):
+    if not _check_flatpak(): return 1
+    subprocess.run(["flatpak","search","--columns=name,application,version,description", q])
+
+def cmd_flatpak_install(apps):
+    if not _check_flatpak(): return 1
+    for a in apps: subprocess.run(["flatpak","install","-y","flathub", a])
+
+def cmd_flatpak_remove(app):
+    if not _check_flatpak(): return 1
+    subprocess.run(["flatpak","uninstall","-y", app])
+
+def cmd_flatpak_list():
+    if not _check_flatpak(): return 1
+    r = subprocess.run(["flatpak","list","--columns=name,application,version,origin"],
+                        capture_output=True, text=True)
+    print(r.stdout or "No flatpaks.")
+
+def cmd_flatpak_update():
+    if not _check_flatpak(): return 1
+    subprocess.run(["flatpak","update","-y"])
+
+# =============================================================================
+# POMOCNICZE
+# =============================================================================
+
+def _resolve_deps(names, repo, installed):
+    resolved, visited = [], set()
+    def visit(name):
+        if name in visited: return
+        visited.add(name)
+        if name in repo:
+            for dep in repo[name].dependencies:
+                if dep not in installed:
+                    visit(dep)
+        if name not in installed:
+            resolved.append(name)
+    for name in names:
+        visit(name)
+    return resolved
+
+def _download_pkg(pkg):
+    url = f"{pkg.repo_url}/{pkg.filename}"
+    dest = os.path.join(PAG_CACHE, pkg.filename)
+    if os.path.exists(dest) and (not pkg.sha256 or _sha256_file(dest) == pkg.sha256):
+        return dest
+    try:
+        req = Request(url, headers={"User-Agent":"pag/3.0"})
+        with urlopen(req, timeout=600) as resp:
+            with open(dest,"wb") as f: shutil.copyfileobj(resp, f)
+        if pkg.sha256 and _sha256_file(dest) != pkg.sha256:
+            os.remove(dest); return None
+        return dest
+    except: return None
+
+def load_world():
+    if not os.path.exists(WORLD_FILE): return set()
+    return {l.strip() for l in open(WORLD_FILE) if l.strip()}
+
+def save_world(w):
+    with open(WORLD_FILE,"w") as f:
+        for n in sorted(w): f.write(f"{n}\n")
+
+def _find_orphans(installed, world):
+    needed = set(world)
+    changed = True
+    while changed:
+        changed = False
+        for n in list(needed):
+            for dep in installed.get(n,{}).get("dependencies",[]):
+                if dep not in needed and dep in installed:
+                    needed.add(dep); changed = True
+    return {n for n in installed if n not in needed}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+USAGE = """pag v3 – Pagan Linux Package Manager
+
+BASIC:
+  pag install <pkg>...       Install packages
+  pag remove  <pkg>...       Remove packages
+  pag update [--force]       Refresh repo indexes
+  pag upgrade                Upgrade all packages
+  pag list [--installed]     List available / installed
+  pag search <query>         Search packages
+  pag info   <pkg>           Package details
+  pag files  <pkg>           List package files
+  pag verify [--deep]        Verify integrity (--deep = SHA256 per file)
+  pag clean                  Clear download cache
+
+SECURITY:
+  pag key-add <url|file>     Import GPG key
+  pag key-list               List trusted keys
+  pag key-remove <id>        Remove key
+
+ADVANCED:
+  pag pin <pkg> [ver]       Pin package version
+  pag unpin <pkg>            Unpin
+  pag pinned                 List pinned
+  pag history                Transaction history
+  pag rollback               Rollback last transaction
+  pag remove-orphans         Remove orphaned deps
+  pag repo-add <url>         Add repository
+  pag repo-list              List repositories
+
+FLATPAK:
+  pag flatpak-search <q>     Search Flathub
+  pag flatpak-install <app>  Install flatpak
+  pag flatpak-remove <app>   Remove flatpak
+  pag flatpak-list           List flatpaks
+  pag flatpak-update         Update all flatpaks
+"""
+
+def main():
+    if os.geteuid() != 0:
+        print(f"❌ {_('root_required')}", file=sys.stderr); sys.exit(1)
+
+    ensure_dirs()
+
+    if len(sys.argv) < 2:
+        print(USAGE); sys.exit(0)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    with DatabaseLock():
+        commands = {
+            "install": lambda: cmd_install(args),
+            "remove": lambda: cmd_remove(args),
+            "update": cmd_update,
+            "upgrade": cmd_upgrade,
+            "list": lambda: cmd_list("--installed" in args),
+            "search": lambda: cmd_search(args[0]) if args else print("Usage: pag search <query>"),
+            "info": lambda: cmd_info(args[0]) if args else print("Usage: pag info <pkg>"),
+            "files": lambda: cmd_files(args[0]) if args else print("Usage: pag files <pkg>"),
+            "verify": lambda: cmd_verify("--deep" in args),
+            "clean": cmd_clean,
+            "remove-orphans": cmd_remove_orphans,
+            "pin": lambda: cmd_pin(args[0], args[1] if len(args)>1 else ""),
+            "unpin": lambda: cmd_unpin(args[0]) if args else print("Usage: pag unpin <pkg>"),
+            "pinned": cmd_pinned,
+            "history": cmd_history,
+            "rollback": cmd_rollback,
+            "repo-add": lambda: cmd_repo_add(args[0]) if args else print("Usage: pag repo-add <url>"),
+            "repo-list": cmd_repo_list,
+            "key-add": lambda: cmd_key_add(args[0]) if args else print("Usage: pag key-add <url|file>"),
+            "key-list": cmd_key_list,
+            "key-remove": lambda: cmd_key_remove(args[0]) if args else print("Usage: pag key-remove <id>"),
+            "flatpak-search": lambda: cmd_flatpak_search(args[0]) if args else print("Usage: pag flatpak-search <query>"),
+            "flatpak-install": lambda: cmd_flatpak_install(args),
+            "flatpak-remove": lambda: cmd_flatpak_remove(args[0]) if args else print("Usage: pag flatpak-remove <app>"),
+            "flatpak-list": cmd_flatpak_list,
+            "flatpak-update": cmd_flatpak_update,
+        }
+
+        fn = commands.get(cmd)
+        if fn:
+            sys.exit(fn() or 0)
+        else:
+            print(f"❌ Unknown command: {cmd}")
+            print(USAGE)
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()

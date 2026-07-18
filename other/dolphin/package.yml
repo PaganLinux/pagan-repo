@@ -1,0 +1,60 @@
+name: dolphin
+version: 26.04.3
+release: 119
+source:
+- https://download.kde.org/stable/release-service/26.04.3/src/dolphin-26.04.3.tar.xz: d18579587f841ca5a571c3614bda0beed6e53bf5ded4d456009e187cbb9d0b44
+homepage: https://kde.org/applications/system/org.kde.dolphin
+license:
+- BSD-2-Clause
+- BSD-3-Clause
+- CC0-1.0
+- GPL-2.0-only
+- GPL-2.0-or-later
+- LGPL-2.0-only
+- LGPL-2.0-or-later
+- LGPL-2.1-only
+- LGPL-3.0-only
+- MIT
+summary: KDE file manager focusing on usability
+description: 'Dolphin is a file manager focusing on usability. Focusing on usability means that features are discoverable
+  and efficient to use.
+
+  '
+component: desktop.kde.core
+category: other
+builddeps:
+- pkgconfig(Qt6Multimedia)
+- pkgconfig(packagekitqt6)
+- pkgconfig(phonon4qt6)
+- baloo-widgets-devel
+- kf6-baloo-devel
+- kf6-kcmutils-devel
+- kf6-kcrash-devel
+- kf6-kdbusaddons-devel
+- kf6-kdoctools-devel
+- kf6-kiconthemes-devel
+- kf6-knewstuff-devel
+- kf6-knotifications-devel
+- kf6-kparts-devel
+- kf6-ktextwidgets-devel
+- kf6-kuserfeedback-devel
+- qt6-base-private-devel
+rundeps:
+- ffmpegthumbs
+setup: '%cmake_kf6
+
+  '
+build: '%ninja_build
+
+  '
+install: '%ninja_install
+
+  %install_license LICENSES/*
+
+
+  # remove doc
+
+  rm -rfv $installdir/usr/share/doc
+
+  '
+patterns: []

@@ -1,0 +1,31 @@
+name: dash
+version: 0.5.13.4
+release: 20
+source:
+- https://git.kernel.org/pub/scm/utils/dash/dash.git/snapshot/dash-0.5.13.4.tar.gz: 652e95024b75758dcd141b64a0d3973a026cc6aaee1aec81ce03e76dc3e6a267
+homepage: https://git.kernel.org/pub/scm/utils/dash/dash.git/
+license: GPL-3.0-or-later
+summary: POSIX compliant shell
+description: 'Dash is a POSIX compliant shell. It can be installed as /bin/sh or as the default shell for either root or a
+  second user with a userid of 0. It depends on fewer libraries than the Bash shell and is therefore less likely to be affected
+  by an upgrade problem or disk failure. Dash is also useful for checking that a script is completely compatible with POSIX
+  syntax.
+
+  '
+component: system.utils
+category: other
+builddeps:
+- pkgconfig(libedit)
+rundeps: []
+setup: '%reconfigure --with-libedit
+
+  '
+build: '%make
+
+  '
+install: '%make_install
+
+  %install_license COPYING
+
+  '
+patterns: []

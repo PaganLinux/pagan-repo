@@ -1,0 +1,26 @@
+name: dialog
+version: '1.3_20240307'
+release: 6
+source:
+- https://invisible-island.net/archives/dialog/dialog-1.3-20240307.tgz: 339d311c6abb240213426b99ad63565cbcb3e8641ef1989c033e945b754d34ef
+homepage: https://invisible-island.net/dialog/dialog.html
+license: LGPL-2.1-or-later
+summary: Script-driven curses widgets
+description: 'Dialog is a script interface for command-line GUI creation.
+
+  '
+component: programming.library
+category: other
+builddeps:
+- pkgconfig(ncursesw)
+rundeps: []
+setup: "%configure_no_runstatedir \\\n           --enable-nls \\\n           --with-ncursesw \\\n           --disable-static\
+  \ \\\n           --with-libtool \\\n           --enable-shared\n"
+build: '%make
+
+  '
+install: '%make_install
+
+  '
+patterns:
+- devel: /usr/bin/dialog-config

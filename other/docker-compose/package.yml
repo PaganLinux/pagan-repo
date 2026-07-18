@@ -1,0 +1,49 @@
+name: docker-compose
+version: 5.3.1
+release: 65
+source:
+- https://github.com/docker/compose/archive/refs/tags/v5.3.1.tar.gz: 1823e1b09c4082779fdf5cc9f3d8453b95dba3d939105b39366175ce12fdb6c7
+homepage: https://docs.docker.com/compose/
+license: Apache-2.0
+summary: A tool for defining and running multi-container Docker applications.
+description: 'Compose is a tool for defining and running multi-container Docker applications.
+
+  With Compose, you use a Compose file to configure your application’s services. Then, using a single command, you create
+  and start all the services from your configuration.
+
+  '
+component: virt
+category: other
+builddeps:
+- git
+- golang
+rundeps:
+- docker
+setup: 'go mod vendor
+
+  '
+build: 'export GOFLAGS+=" -ldflags=-X=${_compose_r}/v2/internal.Version=v$version"
+
+
+  # Git commit corresponding to the version tag
+
+  export GITCOMMIT="$(git ls-remote https://github.com/docker/compose.git refs/tags/v$version | awk ''{print $1}'')"
+
+
+  go build -tags "e2e,kube" -o docker-compose ./cmd
+
+  '
+install: 'install -Ddm00755 ${installdir}/%libdir%/docker/cli-plugins
+
+  install -m00755 ${workdir}/docker-compose ${installdir}/%libdir%/docker/cli-plugins/docker-compose
+
+
+  install -dm00755 ${installdir}/usr/bin
+
+  ln -srv ${installdir}/%libdir%/docker/cli-plugins/docker-compose ${installdir}/usr/bin/docker-compose
+
+
+  %install_license LICENSE
+
+  '
+patterns: []

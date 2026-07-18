@@ -1,0 +1,26 @@
+name: dmenu
+version: '5.4'
+release: 9
+source:
+- https://dl.suckless.org/tools/dmenu-5.4.tar.gz: 8fbace2a0847aa80fe861066b118252dcc7b4ca0a0a8f3a93af02da8fb6cd453
+homepage: https://tools.suckless.org/dmenu/
+license: MIT
+summary: dmenu is a dynamic menu for X, originally designed for dwm.
+description: 'dmenu is a dynamic menu for X, originally designed for dwm.
+
+  '
+component: desktop
+category: desktop
+builddeps:
+- pkgconfig(freetype2)
+- pkgconfig(xft)
+- pkgconfig(xinerama)
+rundeps: []
+setup: ''
+build: '%make X11INC=/usr/include/X11 X11LIB=/usr/lib/X11 FREETYPEINC=/usr/include/freetype2
+
+  '
+install: '%make_install PREFIX=/usr
+
+  '
+patterns: []
